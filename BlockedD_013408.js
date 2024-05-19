@@ -104,7 +104,7 @@ Y>Top && Y<Bottom
 var url = document.getElementsByClassName("ClassLinkConverter")[0];
 
 
-window.open(url.href,"_blank",null);
+window.open(url,"_blank",null);
 
 }
 
