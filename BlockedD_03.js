@@ -62,7 +62,7 @@ div.style.right="0px";
 div.style.bottom="0px";
 
 div.style.width = 1*window.innerWidth+"px";
-div.style.height = 2*window.innerHeight+"px";
+div.style.height = 1*window.innerHeight+"px";
 
 div.style.display="flex";
 div.style.justifyContent="center";
