@@ -2,7 +2,7 @@ function ParseBlockedD(){
 
 var ButtonUID = "button";
 
-var DivUID = "div-gpt";
+var DivUID = "div-gpt-ad-1606164528140-0";
 
 var blocked = false;
 	
