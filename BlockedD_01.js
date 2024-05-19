@@ -2,7 +2,7 @@ function ParseBlockedD(){
 
 var ButtonUID = "button";
 
-var DivUID = "div-gpt-ad-1606164528140-0";
+var DivUID = "div-gpt-ad-1690389143809-0"/*"div-gpt-ad-1606164528140-0"*/;
 
 var blocked = false;
 	
@@ -101,10 +101,10 @@ Y>Top && Y<Bottom
 ){
 
 //var url = document.getElementById("button").getElementsByTagName("a")[0];
-var url = document.getElementsByClassName("ClassLinkConverter")[0];
+//var url = document.getElementsByClassName("ClassLinkConverter")[0];
 
 
-window.open(url,"_blank",null);
+//window.open(url,"_blank",null);
 
 }
 
