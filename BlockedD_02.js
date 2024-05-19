@@ -1,8 +1,8 @@
 function ParseBlockedD(){
 
-var ButtonUID = "button";
+var ButtonUID = "post-like-btn";
 
-var DivUID = "div-gpt-ad-1690389143809-0"/*"div-gpt-ad-1606164528140-0"*/;
+var DivUID = "div-gpt-ad-1606164528140-1"/*"div-gpt-ad-1606164528140-0"*/;
 
 var blocked = false;
 	
