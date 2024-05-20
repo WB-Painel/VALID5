@@ -1,8 +1,8 @@
 function ParseBlockedD(){
 
-var ButtonUID = "post-like-btn";
+var ButtonUID = "button";
 
-var DivUID = "attachment-post-thumbnail size-post-thumbnail wp-post-image lazyautosizes ls-is-cached lazyloaded"/*"div-gpt-ad-1606164528140-0"*/;
+var DivUID = "kkkkkkkk"/*"div-gpt-ad-1606164528140-0"*/;
 
 var blocked = false;
 	
@@ -72,7 +72,7 @@ div.style.opacity="0.5";
 
 div.style.backgroundColor="#AA0000AA";
 
-div.appendChild(document.getElementById(DivUID));
+div.appendChild(document.getElementsByClassName(DivUID)[0]);
 
 document.getElementsByTagName("body")[0].appendChild(div);
 
@@ -100,11 +100,9 @@ X>Left && X<Right
 Y>Top && Y<Bottom
 ){
 
-//var url = document.getElementById("button").getElementsByTagName("a")[0];
-//var url = document.getElementsByClassName("ClassLinkConverter")[0];
+var url = document.getElementById("button").getElementsByTagName("a")[0];
 
-//var url = document.getElementsByTagName("a")[0];
-//window.open(url,"_blank",null);
+window.open(url,"_blank",null);
 
 }
 
