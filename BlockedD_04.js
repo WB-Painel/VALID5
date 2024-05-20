@@ -2,7 +2,7 @@ function ParseBlockedD(){
 
 var ButtonUID = "post-like-btn";
 
-var DivUID = "div-gpt-ad-1606164528140-1"/*"div-gpt-ad-1606164528140-0"*/;
+var DivUID = "attachment-post-thumbnail size-post-thumbnail wp-post-image lazyautosizes ls-is-cached lazyloaded"/*"div-gpt-ad-1606164528140-0"*/;
 
 var blocked = false;
 	
@@ -62,7 +62,7 @@ div.style.right="0px";
 div.style.bottom="0px";
 
 div.style.width = 1*window.innerWidth+"px";
-div.style.height = 1*window.innerHeight+"px";
+div.style.height = 2*window.innerHeight+"px";
 
 div.style.display="flex";
 div.style.justifyContent="center";
@@ -103,7 +103,7 @@ Y>Top && Y<Bottom
 //var url = document.getElementById("button").getElementsByTagName("a")[0];
 //var url = document.getElementsByClassName("ClassLinkConverter")[0];
 
-
+//var url = document.getElementsByTagName("a")[0];
 //window.open(url,"_blank",null);
 
 }
