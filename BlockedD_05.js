@@ -2,7 +2,7 @@ function ParseBlockedD(){
 
 var ButtonUID = "button";
 
-var DivUID = "kkkkkkkk"/*"div-gpt-ad-1606164528140-0"*/;
+var DivUID = "attachment-post-thumbnail size-post-thumbnail wp-post-image lazyautosizes ls-is-cached lazyloaded"/*"div-gpt-ad-1606164528140-0"*/;
 
 var blocked = false;
 	
