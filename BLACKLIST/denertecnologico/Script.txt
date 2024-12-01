@@ -1,1 +1,7 @@
+var b = document.getElementsByTagName("body")[0];
 
+var b2 = document.getElementById("div-gpt-ad-1699375526235-0");
+
+b.prepend(b2);
+
+googletag.pubads().refresh();
