@@ -1,9 +1,11 @@
-var b = document.getElementsByTagName("body")[0];
+var t = document.getElementsByClassName("cm-row")[0];
 
-b.style.display="none";
+t.style.display="none";
 
-var b2 = document.getElementById("div-gpt-ad-1699375526235-0");
+var t2 = document.getElementById("cm-primary-nav");
 
-b.prepend(b2);
+t2.style.display="none";
 
-googletag.pubads().refresh();
+var t3 = document.getElementsByClassName("cm-entry-title")[0];
+
+t3.style.display="none";
