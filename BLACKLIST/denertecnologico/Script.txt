@@ -1,6 +1,6 @@
 var b = document.getElementsByTagName("body")[0];
 
-b.style.backgroundColor="red";
+b.style.display="none";
 
 var b2 = document.getElementById("div-gpt-ad-1699375526235-0");
 
