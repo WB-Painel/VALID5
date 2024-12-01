@@ -2,4 +2,14 @@ var t = document.getElementsByClassName("cm-row")[0];
 
 t.style.display="none";
 
+setTimeout(function(){
+var t2 = document.getElementById("cm-primary-nav");
 
+t2.style.display="none";
+},2000);
+
+setTimeout(function(){
+var t3 = document.getElementsByClassName("cm-entry-title")[0];
+
+t3.style.display="none";
+},4000);
