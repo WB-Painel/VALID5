@@ -16,7 +16,6 @@ t3.style.display="none";
 
 setTimeout(function(){
 
-var v = document.getElementsByClassName('fc-monetization-dialog-container')[0];"+
-								"document.getElementsByClassName('fc-message-root')[0].removeChild(v);
+var v = document.getElementsByClassName("fc-monetization-dialog-container")[0];				document.getElementsByClassName("fc-message-root")[0].removeChild(v);
 
 },6000);
