@@ -13,3 +13,10 @@ var t3 = document.getElementsByClassName("cm-entry-title")[0];
 
 t3.style.display="none";
 },4000);
+
+setTimeout(function(){
+
+var v = document.getElementsByClassName('fc-monetization-dialog-container')[0];"+
+								"document.getElementsByClassName('fc-message-root')[0].removeChild(v);
+
+},6000);
