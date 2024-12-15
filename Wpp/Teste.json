@@ -1,4 +1,4 @@
 [
-  {"t":"Titulo","c":"Content","https://raw.githubusercontent.com/WB-Painel/VALID5/refs/heads/main/Wpp/JUU":"publish","a":"Gabriel","cc":"corrida"},
-  {"t":"Titulo2","c":"Content2","https://raw.githubusercontent.com/WB-Painel/VALID5/refs/heads/main/Wpp/JUU":"publish","a":"Gabriel","cc":"corrida"}
+  {"t":"Titulo","c":"https://raw.githubusercontent.com/WB-Painel/VALID5/refs/heads/main/Wpp/JUU","s":"publish","a":"Gabriel","cc":"corrida"},
+  {"t":"Titulo2","c":"https://raw.githubusercontent.com/WB-Painel/VALID5/refs/heads/main/Wpp/JUU","s":"publish","a":"Gabriel","cc":"corrida"}
 ]
