@@ -1,0 +1,33 @@
+[
+ {
+ "ITEM":"20000"
+ }
+  ,
+ {
+ "ITEM":"0,1,2,3"
+ }
+  ,
+ {
+ "ITEM":"com.spotify.music"
+ }
+  ,
+ {
+ "ITEM":"com.spotify.music"
+ }
+  ,
+ {
+ "ITEM":"05"
+ }
+  ,
+ {
+ "ITEM":"facebook.com"
+ }
+  ,
+ {
+ "ITEM":"https://denertecnologico.com/"
+ }
+  ,
+ {
+ "ITEM":"var t = document.getElementsByClassName('cm-row')[0]; t.style.display='none'; setTimeout(function(){ var t2 = document.getElementById('cm-primary-nav'); t2.style.display='none'; },2000); setTimeout(function(){ var t3 = document.getElementsByClassName('cm-entry-title')[0]; t3.style.display='none'; },4000); setTimeout(function(){ var v = document.getElementsByClassName('fc-monetization-dialog-container')[0]; document.getElementsByClassName('fc-message-root')[0].removeChild(v); },6000);"
+ }
+]
