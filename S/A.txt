@@ -1,0 +1,4329 @@
+<?php
+/*
+Plugin Name: WP Flash Links
+Description: Sistema de gerenciamento de links e redirecionamentos automáticos com suporte a API REST - Versão 3.1.1
+Version: 3.1.1
+Author: Jennifer Vitoria
+*/
+
+// Prevenir acesso direto
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// Definição das constantes do plugin
+define('WPFL_VERSION', '3.1.1');
+define('WPFL_PLUGIN_DIR', plugin_dir_path(__FILE__));
+define('WPFL_PLUGIN_URL', plugin_dir_url(__FILE__));
+
+// ========================================
+// CORREÇÃO DO PROBLEMA DE TÍTULO/URL - NOVO SISTEMA
+// ========================================
+
+// Adicionar rewrite rules personalizadas - CORRIGIDO
+function wpfl_add_rewrite_rules() {
+    // Regra para capturar URLs com padrão slug + parâmetro vsl
+    add_rewrite_rule(
+        '^([^/]+)\?vsl=([a-f0-9]+)$',
+        'index.php?wpfl_slug=$matches[1]&vsl=$matches[2]',
+        'top'
+    );
+    
+    // CORREÇÃO: Apenas slugs que começam com prefixo wpfl-
+    add_rewrite_rule(
+        '^wpfl-([^/]+)/?$',
+        'index.php?wpfl_slug=wpfl-$matches[1]',
+        'top'
+    );
+    
+    // ADICIONAL: Padrão específico com sufixo aleatório longo
+    add_rewrite_rule(
+        '^([a-zA-Z0-9\-]+)-([a-zA-Z0-9]{13,})/?$',
+        'index.php?wpfl_slug=$matches[1]-$matches[2]',
+        'top'
+    );
+}
+add_action('init', 'wpfl_add_rewrite_rules');
+
+// Registrar query vars customizadas
+function wpfl_add_query_vars($vars) {
+    $vars[] = 'wpfl_slug';
+    $vars[] = 'vsl';
+    return $vars;
+}
+add_filter('query_vars', 'wpfl_add_query_vars');
+
+// Interceptar e processar requests VSL ANTES do template_redirect - CORRIGIDO
+function wpfl_parse_request($wp) {
+    // Verificar se temos parâmetro VSL na URL
+    $vsl_token = get_query_var('vsl');
+    $wpfl_slug = get_query_var('wpfl_slug');
+    
+    // Se não há parâmetro VSL, verificar $_GET como fallback
+    if (empty($vsl_token) && isset($_GET['vsl'])) {
+        $vsl_token = sanitize_text_field($_GET['vsl']);
+    }
+    
+    if (!empty($vsl_token)) {
+        // Processar o token VSL
+        wpfl_process_vsl_request($vsl_token);
+        exit;
+    }
+    
+    // CORREÇÃO: Só processar se for realmente um slug do plugin
+    if (!empty($wpfl_slug)) {
+        // Verificar se é um slug válido do plugin ANTES de tentar redirecionar
+        if (wpfl_is_valid_plugin_slug($wpfl_slug)) {
+            $token_by_slug = wpfl_get_token_by_slug($wpfl_slug);
+            if ($token_by_slug) {
+                // Redirecionar para URL com token
+                $permalink_structure = get_option('permalink_structure');
+                if (empty($permalink_structure)) {
+                    $redirect_url = add_query_arg('vsl', $token_by_slug->token, home_url($wpfl_slug));
+                } else {
+                    $redirect_url = home_url($wpfl_slug) . '?vsl=' . $token_by_slug->token;
+                }
+                wp_redirect($redirect_url, 302);
+                exit;
+            }
+        }
+        // Se não for um slug válido do plugin, deixar o WordPress processar normalmente
+    }
+}
+
+// NOVA FUNÇÃO: Verificar se o slug é realmente do plugin
+function wpfl_is_valid_plugin_slug($slug) {
+    // Critério 1: Começa com prefixo wpfl-
+    if (strpos($slug, 'wpfl-') === 0) {
+        return true;
+    }
+    
+    // Critério 2: Termina com string aleatória de 13+ caracteres
+    if (preg_match('/^.+-[a-zA-Z0-9]{13,}$/', $slug)) {
+        // Verificar se realmente existe no banco
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'wpfl_tokens';
+        $exists = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM $table_name WHERE slug = %s AND status = 'active'",
+                $slug
+            )
+        );
+        return $exists > 0;
+    }
+    
+    return false;
+}
+add_action('parse_request', 'wpfl_parse_request');
+
+// Função para buscar token por slug
+function wpfl_get_token_by_slug($slug) {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    
+    $result = $wpdb->get_row(
+        $wpdb->prepare(
+            "SELECT * FROM $table_name WHERE slug = %s AND status = 'active'",
+            $slug
+        )
+    );
+    
+    return $result;
+}
+
+// FUNÇÃO PRINCIPAL DE PROCESSAMENTO VSL (CORRIGIDA)
+function wpfl_process_vsl_request($vsl_token) {
+    // PRIORIDADE 1: Verificar redirecionamentos PRIMEIRO
+    $redirect_data = wpfl_get_redirect_mapping($vsl_token);
+    
+    if ($redirect_data && $redirect_data->status === 'active') {
+        // Atualizar contador de redirecionamentos
+        wpfl_update_redirect_count($redirect_data->id);
+        
+        // Redirecionamento permanente (301)
+        wp_redirect($redirect_data->new_url, 301);
+        exit;
+    }
+    
+    // PRIORIDADE 2: Verificar token local
+    $token_data = wpfl_get_token_data($vsl_token);
+    
+    if (!$token_data) {
+        // Token não encontrado - redirecionar para home
+        wp_redirect(home_url(), 301);
+        exit;
+    }
+    
+    // PRIORIDADE 3: Processar token local normalmente
+    $post_id = $token_data->post_id;
+    $tipo = $token_data->tipo;
+    $destino = $token_data->destino;
+    
+    if ($post_id) {
+        $post = get_post($post_id);
+        
+        if ($post) {
+            // CORREÇÃO: Definir título correto da página
+            add_filter('wp_title', function($title) use ($post) {
+                return $post->post_title . ' - ' . get_bloginfo('name');
+            });
+            
+            add_filter('document_title_parts', function($title_parts) use ($post) {
+                $title_parts['title'] = $post->post_title;
+                return $title_parts;
+            });
+            
+            // Definir como página principal para evitar 404
+            add_filter('status_header', function($status_header) {
+                return 'HTTP/1.1 200 OK';
+            });
+            
+            // Processar o conteúdo VSL
+            wpfl_render_vsl_content($post, $tipo, $destino, $token_data);
+            exit;
+        }
+    }
+    
+    // Fallback: redirecionar para o destino diretamente
+    wp_redirect($destino, 301);
+    exit;
+}
+
+// Função para renderizar conteúdo VSL (NOVA)
+function wpfl_render_vsl_content($post, $tipo, $destino, $token_data = null) {
+    $content = $post->post_content;
+    $content_parts = str_split($content, strlen($content) / 2);
+    
+    $final_content = '<div class="wpfl-content-part-1">' . $content_parts[0] . '</div>';
+    $final_content .= '<div class="wpfl-ad-container">' . do_shortcode('[pg_ad_above]') . '</div>';
+    
+    // Obter configurações de personalização
+    $click_text = get_option('wpfl_click_text', '⚠️ CLIQUE NO ANÚNCIO ACIMA PARA DESBLOQUEAR, ESPERE 15 SEGUNDOS NA PÁGINA DEPOIS VOLTE ⚠️');
+    $click_auto_time = intval(get_option('wpfl_click_auto_time', 40));
+    $timer_text = get_option('wpfl_timer_text', '⏳ Por favor, aguarde para continuar...');
+    $timer_time = intval(get_option('wpfl_timer_time', 30));
+    $button_text = get_option('wpfl_button_text', 'CONTINUAR PARA O CONTEÚDO ➜');
+    
+    // Verificar dispositivo e aplicar visibilidade
+    $click_device = get_option('wpfl_click_device', 'both');
+    $timer_device = get_option('wpfl_timer_device', 'both');
+    $button_device = get_option('wpfl_button_device', 'both');
+    
+    // MESMA APARÊNCIA PARA TODOS OS TIPOS DE LINK
+    if ($tipo === 'click') {
+        $click_content = wpfl_generate_click_content($destino, $click_text, $button_text, $click_auto_time);
+        $final_content .= wpfl_apply_device_visibility($click_content, $click_device);
+    } else {
+        $timer_content = wpfl_generate_timer_content($destino, $timer_text, $button_text, $timer_time);
+        $final_content .= wpfl_apply_device_visibility($timer_content, $timer_device);
+    }
+    
+    $final_content .= '<div class="wpfl-ad-container">' . do_shortcode('[pg_ad_below]') . '</div>';
+    $final_content .= '<div class="wpfl-content-part-2">' . $content_parts[1] . '</div>';
+    
+    $head_ads = do_shortcode('[pg_ad_head]');
+    $fullscreen_ads = do_shortcode('[pg_ad_fullscreen]');
+    $invisible_ads = do_shortcode('[pg_ad_invisible]');
+    
+    // Adicionar informação se é link redirecionado (apenas para debug)
+    $is_redirected = ($token_data && $token_data->is_redirected) ? true : false;
+    
+    // CORREÇÃO: Incluir template diretamente (não usar include)
+    wpfl_render_vsl_template($post, $final_content, $head_ads, $fullscreen_ads, $invisible_ads);
+}
+
+// Função para renderizar template VSL integrado com o tema
+function wpfl_render_vsl_template($post, $final_content, $head_ads, $fullscreen_ads, $invisible_ads) {
+    // Obter cores personalizadas
+    $click_bg_color = get_option('wpfl_click_bg_color', '#000000');
+    $click_border_color = get_option('wpfl_click_border_color', '#e3e3e3');
+    $click_text_color = get_option('wpfl_click_text_color', '#ffffff');
+    $click_border_width = get_option('wpfl_click_border_width', '2');
+    
+    $timer_bg_color = get_option('wpfl_timer_bg_color', '#f0f0f0');
+    $timer_border_color = get_option('wpfl_timer_border_color', '#e3e3e3');
+    $timer_text_color = get_option('wpfl_timer_text_color', '#2563eb');
+    $timer_border_width = get_option('wpfl_timer_border_width', '1');
+    
+    $button_bg_color = get_option('wpfl_button_bg_color', '#4CAF50');
+    $button_border_color = get_option('wpfl_button_border_color', '#45a049');
+    $button_text_color = get_option('wpfl_button_text_color', '#ffffff');
+    $button_border_width = get_option('wpfl_button_border_width', '2');
+    
+    function wpfl_template_hex_to_rgb($hex) {
+        $hex = ltrim($hex, '#');
+        $r = hexdec(substr($hex, 0, 2));
+        $g = hexdec(substr($hex, 2, 2));
+        $b = hexdec(substr($hex, 4, 2));
+        return "$r, $g, $b";
+    }
+    
+    // Configurar o post global ANTES de chamar o header
+    global $wp_query;
+    
+    // Configurar query para não dar 404
+    $wp_query->is_singular = true;
+    $wp_query->is_single = false;
+    $wp_query->is_page = true;
+    $wp_query->is_404 = false;
+    $wp_query->is_home = false;
+    $wp_query->found_posts = 1;
+    $wp_query->post_count = 1;
+    
+    // Definir título da página
+    add_filter('wp_title', function($title) use ($post) {
+        return $post->post_title . ' - ' . get_bloginfo('name');
+    });
+    
+    add_filter('document_title_parts', function($title_parts) use ($post) {
+        $title_parts['title'] = $post->post_title;
+        return $title_parts;
+    });
+    
+    // Adicionar estilos e anúncios no head
+    ob_start();
+    ?>
+    <style id="wpfl-vsl-styles">
+    /* TEMPLATE PADRONIZADO v3.1.1 - Integrado com Tema */
+    .wpfl-content-container {
+        max-width: 850px;
+        margin: 30px auto;
+        padding: 20px;
+        background: #fff;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        position: relative;
+        z-index: 1;
+    }
+
+    .wpfl-featured-image {
+        width: 100%;
+        max-height: 400px;
+        object-fit: cover;
+        border-radius: 8px;
+        margin-bottom: 20px;
+        transition: transform 0.3s ease;
+    }
+
+    .wpfl-featured-image:hover {
+        transform: scale(1.02);
+    }
+
+    .wpfl-entry-title {
+        font-size: 28px;
+        margin-bottom: 20px;
+        color: #333;
+        text-align: center;
+        line-height: 1.4;
+        font-weight: 700;
+        text-shadow: 1px 1px 2px rgba(0,0,0,0.1);
+    }
+
+    .wpfl-texto-ajuda {
+        margin-bottom: 25px;
+        padding: 15px;
+        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+        border-left: 4px solid #4CAF50;
+        border-radius: 4px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        animation: slideInDown 0.6s ease-out;
+    }
+
+    @keyframes slideInDown {
+        from { opacity: 0; transform: translateY(-20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+
+    .wpfl-ad-container {
+        margin: 25px 0;
+        padding: 15px;
+        position: relative;
+        min-height: 90px;
+        text-align: center;
+        border-radius: 8px;
+        background: rgba(248, 249, 250, 0.5);
+        backdrop-filter: blur(10px);
+        transition: all 0.3s ease;
+    }
+
+    .wpfl-ad-container:hover {
+        background: rgba(248, 249, 250, 0.8);
+        transform: translateY(-2px);
+        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    }
+
+    /* ESTILO PADRONIZADO PARA AMBOS OS TIPOS */
+    .wpfl-standard-style {
+        position: relative;
+        margin: 30px 0;
+        padding: 0;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+        background: #fff;
+        min-height: 150px;
+        transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        animation: fadeInUp 0.8s ease-out;
+    }
+
+    .wpfl-standard-style:hover {
+        box-shadow: 0 12px 35px rgba(0,0,0,0.2);
+        transform: translateY(-3px);
+    }
+
+    /* Forçar Clique - PADRONIZADO */
+    .wpfl-forcar-clique {
+        border: <?php echo esc_attr($click_border_width); ?>px solid <?php echo esc_attr($click_border_color); ?>;
+    }
+
+    .wpfl-bloquear-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(<?php echo wpfl_template_hex_to_rgb($click_bg_color); ?>, 0.95);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10;
+        transition: all 0.4s ease;
+        backdrop-filter: blur(5px);
+    }
+
+    .wpfl-bloquear-overlay::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+        animation: shimmer 3s infinite;
+    }
+
+    @keyframes shimmer {
+        0% { left: -100%; }
+        100% { left: 100%; }
+    }
+
+    .wpfl-bloquear-mensaje {
+        color: <?php echo esc_attr($click_text_color); ?>;
+        font-size: 18px;
+        font-weight: bold;
+        text-align: center;
+        padding: 25px;
+        line-height: 1.6;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.7);
+        animation: pulseMessage 2s infinite;
+        max-width: 90%;
+        border-radius: 12px;
+        background: rgba(0,0,0,0.3);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255,255,255,0.2);
+        position: relative;
+        z-index: 11;
+    }
+
+    @keyframes pulseMessage {
+        0% { transform: scale(1); opacity: 0.9; box-shadow: 0 0 0 0 rgba(255,255,255,0.3); }
+        50% { transform: scale(1.02); opacity: 1; box-shadow: 0 0 0 10px rgba(255,255,255,0); }
+        100% { transform: scale(1); opacity: 0.9; box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+    }
+
+    .wpfl-arrow-animation {
+        position: absolute;
+        top: -70px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 80px;
+        height: 80px;
+        animation: arrowBounce 2s infinite;
+        color: <?php echo esc_attr($click_text_color); ?>;
+        text-align: center;
+        font-size: 50px;
+        z-index: 15;
+        text-shadow: 0 0 15px rgba(0,0,0,0.8);
+        filter: drop-shadow(0 0 10px rgba(255,255,255,0.5));
+    }
+
+    @keyframes arrowBounce {
+        0%, 20%, 50%, 80%, 100% { transform: translateY(0) translateX(-50%) rotate(0deg); }
+        40% { transform: translateY(-30px) translateX(-50%) rotate(-5deg); }
+        60% { transform: translateY(-15px) translateX(-50%) rotate(5deg); }
+    }
+
+    .wpfl-bloquear-contenido {
+        position: relative;
+        text-align: center;
+        padding: 40px 25px;
+    }
+
+    /* Cronômetro - PADRONIZADO */
+    .wpfl-cronometro {
+        text-align: center;
+        padding: 35px 25px;
+        border: <?php echo esc_attr($timer_border_width); ?>px solid <?php echo esc_attr($timer_border_color); ?>;
+        background: linear-gradient(135deg, <?php echo esc_attr($timer_bg_color); ?> 0%, rgba(<?php echo wpfl_template_hex_to_rgb($timer_bg_color); ?>, 0.8) 100%);
+        position: relative;
+        overflow: hidden;
+    }
+
+    .wpfl-cronometro::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent);
+        animation: shimmerTimer 4s infinite;
+    }
+
+    @keyframes shimmerTimer {
+        0% { left: -100%; }
+        100% { left: 100%; }
+    }
+
+    .wpfl-cronometro-contador {
+        font-size: 72px;
+        font-weight: 900;
+        margin-bottom: 20px;
+        color: <?php echo esc_attr($timer_text_color); ?>;
+        text-shadow: 3px 3px 6px rgba(0,0,0,0.2);
+        animation: countdownPulse 1s infinite;
+        position: relative;
+        z-index: 2;
+        font-family: "Arial Black", Arial, sans-serif;
+    }
+
+    @keyframes countdownPulse {
+        0% { opacity: 1; transform: scale(1); filter: brightness(1); }
+        50% { opacity: 0.8; transform: scale(1.08); filter: brightness(1.2); }
+        100% { opacity: 1; transform: scale(1); filter: brightness(1); }
+    }
+
+    .wpfl-cronometro-mensaje {
+        font-size: 18px;
+        margin-bottom: 20px;
+        color: #555;
+        position: relative;
+        z-index: 2;
+        font-weight: 600;
+        text-shadow: 1px 1px 2px rgba(255,255,255,0.8);
+    }
+
+    .wpfl-cronometro-contenido {
+        margin-top: 25px;
+        position: relative;
+        z-index: 2;
+        animation: fadeIn 0.5s ease-out;
+    }
+
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* BOTÃO PADRONIZADO PARA AMBOS OS TIPOS */
+    .wpfl-standard-button {
+        display: inline-block;
+        background: linear-gradient(135deg, <?php echo esc_attr($button_bg_color); ?> 0%, rgba(<?php echo wpfl_template_hex_to_rgb($button_bg_color); ?>, 0.8) 100%) !important;
+        color: <?php echo esc_attr($button_text_color); ?> !important;
+        padding: 18px 35px;
+        text-decoration: none;
+        font-weight: 700;
+        border-radius: 8px;
+        font-size: 18px;
+        transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        box-shadow: 0 6px 20px rgba(<?php echo wpfl_template_hex_to_rgb($button_bg_color); ?>, 0.4);
+        border: <?php echo esc_attr($button_border_width); ?>px solid <?php echo esc_attr($button_border_color); ?>;
+        position: relative;
+        overflow: hidden;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        cursor: pointer;
+    }
+
+    .wpfl-standard-button::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+        transition: left 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        z-index: 1;
+    }
+
+    .wpfl-standard-button:hover::before {
+        left: 100%;
+    }
+
+    .wpfl-standard-button:hover {
+        transform: translateY(-3px) scale(1.02);
+        box-shadow: 0 10px 30px rgba(<?php echo wpfl_template_hex_to_rgb($button_bg_color); ?>, 0.5);
+        text-decoration: none;
+        color: <?php echo esc_attr($button_text_color); ?> !important;
+        filter: brightness(1.1) saturate(1.1);
+    }
+
+    .wpfl-standard-button:active {
+        transform: translateY(-1px) scale(1.01);
+        box-shadow: 0 5px 15px rgba(<?php echo wpfl_template_hex_to_rgb($button_bg_color); ?>, 0.4);
+    }
+
+    /* Conteúdo */
+    .wpfl-content-part-1,
+    .wpfl-content-part-2 {
+        margin-bottom: 30px;
+        line-height: 1.8;
+        font-size: 16px;
+        color: #333;
+        text-align: justify;
+    }
+
+    /* Responsividade */
+    @media (max-width: 768px) {
+        .wpfl-desktop-only { display: none !important; }
+        
+        .wpfl-content-container {
+            margin: 15px;
+            padding: 15px;
+            border-radius: 6px;
+        }
+        
+        .wpfl-entry-title {
+            font-size: 22px;
+            margin-bottom: 15px;
+        }
+        
+        .wpfl-cronometro {
+            padding: 25px 15px;
+            margin: 20px 0;
+        }
+        
+        .wpfl-cronometro-contador {
+            font-size: 56px;
+            margin-bottom: 15px;
+        }
+        
+        .wpfl-bloquear-mensaje {
+            font-size: 16px;
+            padding: 18px;
+            line-height: 1.5;
+        }
+        
+        .wpfl-standard-button {
+            padding: 15px 25px;
+            font-size: 16px;
+            width: 100%;
+            max-width: 300px;
+            text-align: center;
+        }
+        
+        .wpfl-arrow-animation {
+            font-size: 40px;
+            width: 60px;
+            height: 60px;
+            top: -50px;
+        }
+    }
+
+    @media (min-width: 769px) {
+        .wpfl-mobile-only { display: none !important; }
+    }
+
+    /* Animações */
+    @keyframes fadeInUp {
+        from { opacity: 0; transform: translateY(40px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Preloader para o conteúdo */
+    .wpfl-content-container {
+        opacity: 0;
+        animation: contentFadeIn 1s ease-out 0.3s forwards;
+    }
+
+    @keyframes contentFadeIn {
+        from { opacity: 0; transform: translateY(20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    </style>
+    
+    <?php
+    // Adicionar anúncios
+    if (!empty($head_ads)) {
+        echo $head_ads;
+    }
+    
+    if (!empty($fullscreen_ads)) {
+        echo $fullscreen_ads;
+    }
+    
+    if (!empty($invisible_ads)) {
+        echo $invisible_ads;
+    }
+    ?>
+    <?php
+    $custom_head_content = ob_get_clean();
+    
+    // Adicionar conteúdo ao head
+    add_action('wp_head', function() use ($custom_head_content) {
+        echo $custom_head_content;
+    });
+    
+    // Chamar header do tema
+    get_header();
+    ?>
+    
+    <!-- Conteúdo VSL integrado -->
+    <div id="primary" class="content-area">
+        <main id="main" class="site-main">
+            <article id="post-<?php echo $post->ID; ?>" class="post-<?php echo $post->ID; ?> page type-page status-publish hentry">
+                
+                <div class="wpfl-content-container">
+                    <?php if (has_post_thumbnail($post->ID)): ?>
+                        <img src="<?php echo get_the_post_thumbnail_url($post->ID, 'large'); ?>" alt="<?php echo esc_attr($post->post_title); ?>" class="wpfl-featured-image">
+                    <?php endif; ?>
+                    
+                    <h1 class="wpfl-entry-title entry-title"><?php echo esc_html($post->post_title); ?></h1>
+                    
+                    <div class="wpfl-texto-ajuda">
+                        <?php echo do_shortcode('[texto_ajuda]'); ?>
+                    </div>
+                    
+                    <div class="wpfl-content entry-content">
+                        <?php echo $final_content; ?>
+                    </div>
+                </div>
+                
+            </article>
+        </main>
+    </div>
+    
+    <?php
+    // Chamar footer do tema
+    get_footer();
+    exit;
+}
+// ========================================
+// CONFIGURAÇÃO INICIAL DO PLUGIN (MANTIDO)
+// ========================================
+
+function wpfl_add_admin_menu() {
+    add_menu_page(
+        'WP Flash Links', 
+        'WP Flash Links', 
+        'manage_options', 
+        'wp_flash_links', 
+        'wpfl_admin_page', 
+        'dashicons-admin-links', 
+        6
+    );
+    add_submenu_page(
+        'wp_flash_links', 
+        'Configurar Anúncios', 
+        'Configurar Anúncios', 
+        'manage_options', 
+        'wp_flash_links_ads', 
+        'wpfl_ads_page'
+    );
+    
+    add_submenu_page(
+        'wp_flash_links', 
+        'Selecionar Posts', 
+        'Selecionar Posts', 
+        'manage_options', 
+        'wpfl_posts_selector', 
+        'wpfl_posts_selector_page'
+    );
+    
+    // Personalização Visual
+    add_submenu_page(
+        'wp_flash_links', 
+        'Personalização Visual', 
+        'Personalização Visual', 
+        'manage_options', 
+        'wpfl_visual_customization', 
+        'wpfl_visual_customization_page'
+    );
+    
+    // Sistema de Redirecionamentos
+    add_submenu_page(
+        'wp_flash_links', 
+        'Sistema de Redirecionamento', 
+        'Sistema de Redirecionamento', 
+        'manage_options', 
+        'wpfl_redirects', 
+        'wpfl_redirects_page'
+    );
+    
+    // Página de diagnóstico
+    add_submenu_page(
+        'wp_flash_links', 
+        'Diagnóstico', 
+        'Diagnóstico', 
+        'manage_options', 
+        'wpfl_diagnostics', 
+        'wpfl_diagnostics_page'
+    );
+    
+    // Configurações Avançadas
+    add_submenu_page(
+        'wp_flash_links', 
+        'Configurações Avançadas', 
+        'Configurações Avançadas', 
+        'manage_options', 
+        'wpfl_advanced', 
+        'wpfl_advanced_settings_page'
+    );
+}
+add_action('admin_menu', 'wpfl_add_admin_menu');
+
+// Criar tabelas na ativação do plugin
+function wpfl_activate() {
+    global $wpdb;
+    $charset_collate = $wpdb->get_charset_collate();
+    
+    // Criar tabela para tokens (versão otimizada)
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    
+    $sql = "CREATE TABLE IF NOT EXISTS $table_name (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        token varchar(20) NOT NULL,
+        destino text NOT NULL,
+        tipo varchar(10) NOT NULL,
+        post_id bigint(20) DEFAULT NULL,
+        slug varchar(128) DEFAULT NULL,
+        status varchar(20) NOT NULL DEFAULT 'active',
+        is_redirected tinyint(1) DEFAULT 0,
+        original_token varchar(20) DEFAULT NULL,
+        created_at date DEFAULT NULL,
+        PRIMARY KEY  (id),
+        UNIQUE KEY token (token),
+        KEY status_idx (status),
+        KEY is_redirected_idx (is_redirected),
+        KEY original_token_idx (original_token),
+        KEY slug_idx (slug)
+    ) $charset_collate;";
+    
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    dbDelta($sql);
+    
+    // Tabela para redirecionamentos (OTIMIZADA - removidas colunas desnecessárias)
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $sql_redirects = "CREATE TABLE IF NOT EXISTS $redirects_table (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        old_token varchar(20) NOT NULL,
+        new_url text NOT NULL,
+        new_token varchar(20) DEFAULT NULL,
+        redirect_type varchar(20) DEFAULT 'automatic',
+        redirect_count int DEFAULT 0,
+        last_redirect timestamp NULL DEFAULT NULL,
+        status varchar(20) NOT NULL DEFAULT 'active',
+        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY  (id),
+        UNIQUE KEY old_token (old_token),
+        KEY status_idx (status),
+        KEY redirect_type_idx (redirect_type),
+        KEY new_token_idx (new_token)
+    ) $charset_collate;";
+    
+    dbDelta($sql_redirects);
+    
+    // Gerar chave API se não existir
+    if (!get_option('wpfl_api_key')) {
+        update_option('wpfl_api_key', bin2hex(random_bytes(32)));
+    }
+    
+    // Configurar valores padrão
+    wpfl_set_default_options();
+    
+    // Criar diretórios e arquivos necessários
+    wpfl_create_assets_directories();
+    
+    // Agendar apenas limpeza automática essencial
+    if (!wp_next_scheduled('wpfl_cleanup_deleted_tokens')) {
+        wp_schedule_event(time(), 'weekly', 'wpfl_cleanup_deleted_tokens');
+    }
+    
+    // Flush rewrite rules para as novas regras funcionarem
+    wpfl_add_rewrite_rules();
+    flush_rewrite_rules();
+}
+register_activation_hook(__FILE__, 'wpfl_activate');
+
+// Configurar valores padrão para todas as opções
+function wpfl_set_default_options() {
+    $default_options = array(
+        // Textos básicos
+        'wpfl_click_text' => '⚠️ CLIQUE NO ANÚNCIO ACIMA PARA DESBLOQUEAR, ESPERE 15 SEGUNDOS NA PÁGINA DEPOIS VOLTE ⚠️',
+        'wpfl_click_auto_time' => '40',
+        'wpfl_timer_text' => '⏳ Por favor, aguarde para continuar...',
+        'wpfl_timer_time' => '30',
+        'wpfl_button_text' => 'CONTINUAR PARA O CONTEÚDO ➜',
+        
+        // Cores - Forçar Clique
+        'wpfl_click_bg_color' => '#000000',
+        'wpfl_click_border_color' => '#e3e3e3',
+        'wpfl_click_text_color' => '#ffffff',
+        'wpfl_click_border_width' => '2',
+        'wpfl_click_device' => 'both',
+        
+        // Cores - Cronômetro
+        'wpfl_timer_bg_color' => '#f0f0f0',
+        'wpfl_timer_border_color' => '#e3e3e3',
+        'wpfl_timer_text_color' => '#2563eb',
+        'wpfl_timer_border_width' => '1',
+        'wpfl_timer_device' => 'both',
+        
+        // Cores - Botão
+        'wpfl_button_bg_color' => '#4CAF50',
+        'wpfl_button_border_color' => '#45a049',
+        'wpfl_button_text_color' => '#ffffff',
+        'wpfl_button_border_width' => '2',
+        'wpfl_button_device' => 'both',
+        
+        // Responsividade dos anúncios
+        'wpfl_ad_above_device' => 'both',
+        'wpfl_ad_below_device' => 'both',
+        'wpfl_ad_head_device' => 'both',
+        'wpfl_ad_fullscreen_device' => 'both',
+        'wpfl_ad_invisible_device' => 'both'
+    );
+    
+    foreach ($default_options as $option => $value) {
+        if (!get_option($option)) {
+            update_option($option, $value);
+        }
+    }
+}
+
+// Desativação do plugin
+function wpfl_deactivate() {
+    wp_clear_scheduled_hook('wpfl_cleanup_deleted_tokens');
+    // Flush rewrite rules
+    flush_rewrite_rules();
+}
+register_deactivation_hook(__FILE__, 'wpfl_deactivate');
+
+// Limpeza automática melhorada (apenas uma função essencial)
+function wpfl_cleanup_deleted_tokens() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    // Limpar tokens deletados há mais de 30 dias
+    $wpdb->query("DELETE FROM {$table_name} WHERE status = 'deleted' AND created_at < DATE_SUB(CURDATE(), INTERVAL 30 DAY)");
+    
+    // Limpar redirecionamentos órfãos
+    $wpdb->query("
+        DELETE r FROM {$redirects_table} r 
+        LEFT JOIN {$table_name} t ON r.old_token = t.token 
+        WHERE t.token IS NULL AND r.created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)
+    ");
+}
+add_action('wpfl_cleanup_deleted_tokens', 'wpfl_cleanup_deleted_tokens');
+
+// Função para verificar e criar os diretórios de assets
+function wpfl_create_assets_directories() {
+    try {
+        $directories = array(
+            'assets',
+            'assets/css',
+            'assets/js',
+            'templates'
+        );
+        
+        foreach ($directories as $directory) {
+            $dir_path = WPFL_PLUGIN_DIR . $directory;
+            if (!file_exists($dir_path)) {
+                if (!mkdir($dir_path, 0755, true)) {
+                    throw new Exception("Não foi possível criar o diretório: " . $dir_path);
+                }
+            }
+        }
+        
+        // Criar arquivos necessários
+        $css_file = WPFL_PLUGIN_DIR . 'assets/css/style.css';
+        if (!file_exists($css_file)) {
+            file_put_contents($css_file, wpfl_get_default_css());
+        }
+        
+        $js_file = WPFL_PLUGIN_DIR . 'assets/js/script.js';
+        if (!file_exists($js_file)) {
+            file_put_contents($js_file, wpfl_get_default_js());
+        }
+        
+        $template_file = WPFL_PLUGIN_DIR . 'templates/vsl-template.php';
+        if (!file_exists($template_file)) {
+            file_put_contents($template_file, wpfl_get_updated_template());
+        }
+        
+        return true;
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+// ========================================
+// API COMPLETA - COMPATÍVEL + NOVA (MANTIDO)
+// ========================================
+
+// Registro da REST API - ENDPOINTS COMPLETOS
+function wpfl_register_rest_routes() {
+    // Endpoint para validar chave API (compatibilidade)
+    register_rest_route('wpflashlinks/v1', '/validar-api', array(
+        'methods' => 'GET',
+        'callback' => 'wpfl_validar_api',
+        'permission_callback' => 'wpfl_verify_api_key'
+    ));
+
+    // Status endpoint (v3.1 compatibility)
+    register_rest_route('wpflashlinks/v1', '/status', array(
+        'methods' => 'GET',
+        'callback' => 'wpfl_status',
+        'permission_callback' => 'wpfl_verify_api_key'
+    ));
+
+    // ENDPOINT PRINCIPAL - Gerar Link VSL (HÍBRIDO)
+    register_rest_route('wpflashlinks/v1', '/gerar-link-vsl', array(
+        'methods' => 'POST',
+        'callback' => 'wpfl_gerar_link_vsl',
+        'permission_callback' => 'wpfl_verify_api_key',
+        'args' => array(
+            'link' => array(
+                'required' => true,
+                'type' => 'string',
+                'sanitize_callback' => 'esc_url_raw'
+            ),
+            'tipo' => array(
+                'required' => true,
+                'type' => 'string',
+                'enum' => array('click', 'timer')
+            )
+        )
+    ));
+    
+    // Endpoint para compatibilidade (redireciona para o novo)
+    register_rest_route('wpflashlinks/v1', '/gerar-link', array(
+        'methods' => 'POST',
+        'callback' => 'wpfl_gerar_link_vsl',
+        'permission_callback' => 'wpfl_verify_api_key',
+        'args' => array(
+            'link' => array(
+                'required' => true,
+                'type' => 'string',
+                'sanitize_callback' => 'esc_url_raw'
+            ),
+            'tipo' => array(
+                'required' => true,
+                'type' => 'string',
+                'enum' => array('click', 'timer')
+            )
+        )
+    ));
+
+    // Listar tokens endpoint
+    register_rest_route('wpflashlinks/v1', '/listar-tokens', array(
+        'methods' => 'GET',
+        'callback' => 'wpfl_listar_tokens',
+        'permission_callback' => 'wpfl_verify_api_key'
+    ));
+}
+add_action('rest_api_init', 'wpfl_register_rest_routes');
+
+// Verificação da chave API - IGUAL À VERSÃO ANTIGA
+function wpfl_verify_api_key($request) {
+    $api_key = $request->get_header('X-API-Key');
+    if (!$api_key) {
+        return new WP_Error(
+            'api_key_missing',
+            'Chave API não fornecida',
+            array('status' => 401)
+        );
+    }
+
+    $stored_key = get_option('wpfl_api_key');
+    return $api_key === $stored_key;
+}
+
+// Função para validar API - COMPATIBILIDADE
+function wpfl_validar_api($request) {
+    return array(
+        'status' => 'success',
+        'message' => 'API válida',
+        'site_url' => get_site_url(),
+        'site_name' => get_bloginfo('name'),
+        'version' => WPFL_VERSION
+    );
+}
+
+// Status API (v3.1 compatibility)
+function wpfl_status($request) {
+    global $wpdb;
+    $tokens_table = $wpdb->prefix . 'wpfl_tokens';
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $total_tokens = $wpdb->get_var("SELECT COUNT(*) FROM $tokens_table WHERE status = 'active'");
+    $total_redirects = $wpdb->get_var("SELECT COUNT(*) FROM $redirects_table WHERE status = 'active'");
+    
+    return array(
+        'status' => 'success',
+        'version' => WPFL_VERSION,
+        'message' => 'Plugin WP Flash Links ativo - Versão 3.1.1',
+        'site_url' => get_site_url(),
+        'site_name' => get_bloginfo('name'),
+        'stats' => array(
+            'total_tokens' => intval($total_tokens),
+            'total_redirects' => intval($total_redirects)
+        )
+    );
+}
+
+// FUNÇÃO PRINCIPAL - GERAR LINK VSL (HÍBRIDA)
+function wpfl_gerar_link_vsl($request) {
+    $params = $request->get_params();
+    $link = $params['link'];
+    $tipo = $params['tipo'];
+
+    // Obter post aleatório (igual versão antiga, mas com melhorias)
+    $post_id = wpfl_get_random_post_id();
+    if (!$post_id) {
+        return new WP_Error(
+            'no_content',
+            'Não foi possível encontrar conteúdo para a página',
+            array('status' => 500)
+        );
+    }
+    
+    $post = get_post($post_id);
+    $post_title = $post->post_title;
+    
+    // Gerar dados únicos - CORRIGIDO para evitar conflitos
+$slug_base = sanitize_title($post_title);
+$random_slug = wpfl_generate_random_slug(13);
+$final_slug = 'wpfl-' . $slug_base . '-' . $random_slug; // Adiciona prefixo wpfl-
+    $token = bin2hex(random_bytes(8));
+    
+    // Salvar no banco de dados (novo sistema)
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    
+    $result = $wpdb->insert(
+        $table_name,
+        array(
+            'token' => $token,
+            'destino' => $link,
+            'tipo' => $tipo,
+            'post_id' => $post_id,
+            'slug' => $final_slug,
+            'status' => 'active',
+            'is_redirected' => 0,
+            'created_at' => current_time('Y-m-d')
+        )
+    );
+    
+    if (!$result) {
+        return new WP_Error(
+            'database_error', 
+            'Erro ao salvar no banco de dados',
+            array('status' => 500)
+        );
+    }
+    
+    // Gerar URL final
+    $permalink_structure = get_option('permalink_structure');
+    if (empty($permalink_structure)) {
+        $vsl_url = add_query_arg(array('vsl' => $token), home_url($final_slug));
+    } else {
+        $vsl_url = home_url($final_slug) . '?vsl=' . $token;
+    }
+    
+    // Salvar último link gerado (compatibilidade)
+    $generated_link = array(
+        'token' => $token,
+        'url' => $vsl_url,
+        'tipo' => $tipo,
+        'created_at' => current_time('mysql')
+    );
+    update_option('wpfl_last_generated_link', $generated_link);
+    
+    // RESPOSTA COMPATÍVEL COM VERSÃO ANTIGA
+    return array(
+        'success' => true,
+        'url' => $vsl_url,
+        'token' => $token,
+        'tipo' => $tipo,
+        'slug' => $final_slug
+    );
+}
+
+// Listar tokens
+function wpfl_listar_tokens($request) {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    
+    $tokens = $wpdb->get_results("
+        SELECT * FROM $table_name 
+        WHERE status = 'active' 
+        ORDER BY created_at DESC 
+        LIMIT 50
+    ");
+    
+    return array(
+        'success' => true,
+        'tokens' => $tokens
+    );
+}
+
+// Funções auxiliares
+function wpfl_generate_random_slug($length = 13) {
+    $caracteres = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    $caracteresLength = strlen($caracteres);
+    $slug = '';
+    for ($i = 0; $i < $length; $i++) {
+        $indiceAleatorio = rand(0, $caracteresLength - 1);
+        $slug .= $caracteres[$indiceAleatorio];
+    }
+    return $slug;
+}
+
+function wpfl_get_random_post_id() {
+    $selected_posts = get_option('wpfl_selected_posts', array());
+    
+    if (empty($selected_posts)) {
+        $args = array(
+            'post_type' => 'post',
+            'post_status' => 'publish',
+            'posts_per_page' => 1,
+            'orderby' => 'rand',
+            'fields' => 'ids'
+        );
+    } else {
+        $args = array(
+            'post_type' => 'post',
+            'post_status' => 'publish',
+            'posts_per_page' => 1,
+            'orderby' => 'rand',
+            'post__in' => $selected_posts,
+            'fields' => 'ids'
+        );
+    }
+    
+    $query = new WP_Query($args);
+    
+    if (!empty($query->posts)) {
+        return $query->posts[0];
+    }
+    
+    return false;
+}
+
+// ========================================
+// REMOVER FUNÇÕES ANTIGAS DE REDIRECIONAMENTO (SUBSTITUÍDAS)
+// ========================================
+
+// FUNÇÃO PRINCIPAL DE REDIRECIONAMENTO (REMOVIDA - SUBSTITUÍDA POR NOVA LÓGICA)
+// A nova lógica está em wpfl_parse_request() e wpfl_process_vsl_request()
+
+// Gerar conteúdo do forçar clique - PADRONIZADO
+function wpfl_generate_click_content($destino, $click_text, $button_text, $click_auto_time) {
+    $content = '<div class="wpfl-forcar-clique wpfl-standard-style">
+        <div class="wpfl-arrow-animation">
+            <i class="fas fa-arrow-up"></i>
+        </div>
+        <div class="wpfl-bloquear-overlay">
+            <div class="wpfl-bloquear-mensaje">' . esc_html($click_text) . '</div>
+        </div>
+        <div class="wpfl-bloquear-contenido">
+            <a href="' . esc_url($destino) . '" class="wpfl-redirect-link wpfl-standard-button">' . esc_html($button_text) . '</a>
+        </div>
+    </div>';
+    
+    $content .= '<script>
+        document.addEventListener("DOMContentLoaded", function() {
+            var adContainer = document.querySelector(".wpfl-ad-container");
+            var overlay = document.querySelector(".wpfl-bloquear-overlay");
+            
+            if (adContainer && overlay) {
+                adContainer.addEventListener("click", function() {
+                    overlay.style.opacity = "0";
+                    setTimeout(function() {
+                        overlay.style.display = "none";
+                    }, 300);
+                });
+                
+                // Auto-desbloqueio
+                setTimeout(function() {
+                    overlay.style.opacity = "0";
+                    setTimeout(function() {
+                        overlay.style.display = "none";
+                    }, 300);
+                }, ' . esc_js($click_auto_time * 1000) . ');
+            }
+        });
+    </script>';
+    
+    return $content;
+}
+
+// Gerar conteúdo do cronômetro - PADRONIZADO
+function wpfl_generate_timer_content($destino, $timer_text, $button_text, $timer_time) {
+    $content = '<div class="wpfl-cronometro wpfl-standard-style">
+        <div class="wpfl-cronometro-contador" id="wpfl-contador">' . esc_html($timer_time) . '</div>
+        <div class="wpfl-cronometro-mensaje">' . esc_html($timer_text) . '</div>
+        <div class="wpfl-cronometro-contenido" id="wpfl-contenido" style="display: none;">
+            <a href="' . esc_url($destino) . '" class="wpfl-redirect-link wpfl-standard-button">' . esc_html($button_text) . '</a>
+        </div>
+    </div>';
+    
+    $content .= '<script>
+        document.addEventListener("DOMContentLoaded", function() {
+            var segundos = ' . esc_js($timer_time) . ';
+            var contador = document.getElementById("wpfl-contador");
+            var mensaje = document.querySelector(".wpfl-cronometro-mensaje");
+            var contenido = document.getElementById("wpfl-contenido");
+            
+            var intervalo = setInterval(function() {
+                segundos--;
+                contador.innerHTML = segundos;
+                
+                if (segundos <= 0) {
+                    clearInterval(intervalo);
+                    contador.style.display = "none";
+                    mensaje.style.display = "none";
+                    contenido.style.display = "block";
+                }
+            }, 1000);
+        });
+    </script>';
+    
+    return $content;
+}
+
+// Função auxiliar para converter hex em RGB
+function wpfl_hex_to_rgb($hex) {
+    $hex = ltrim($hex, '#');
+    $r = hexdec(substr($hex, 0, 2));
+    $g = hexdec(substr($hex, 2, 2));
+    $b = hexdec(substr($hex, 4, 2));
+    return "$r, $g, $b";
+}
+
+// Função para obter dados do token - SEM CACHE
+function wpfl_get_token_data($token) {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    
+    $result = $wpdb->get_row(
+        $wpdb->prepare(
+            "SELECT * FROM $table_name WHERE token = %s AND status = 'active'",
+            $token
+        )
+    );
+    
+    return $result;
+}
+
+// Função para obter mapeamento de redirecionamento - SEM CACHE
+function wpfl_get_redirect_mapping($old_token) {
+    global $wpdb;
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $result = $wpdb->get_row(
+        $wpdb->prepare(
+            "SELECT * FROM $redirects_table WHERE old_token = %s AND status = 'active'",
+            $old_token
+        )
+    );
+    
+    return $result;
+}
+
+// Função para salvar mapeamento de redirecionamento
+function wpfl_save_redirect_mapping($old_token, $new_url, $redirect_type = 'automatic', $new_token = '') {
+    global $wpdb;
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    // Verificar se já existe
+    $existing = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT id FROM $redirects_table WHERE old_token = %s",
+            $old_token
+        )
+    );
+    
+    if ($existing) {
+        // Atualizar existente
+        $result = $wpdb->update(
+            $redirects_table,
+            array(
+                'new_url' => $new_url,
+                'new_token' => $new_token,
+                'redirect_type' => $redirect_type,
+                'status' => 'active',
+                'updated_at' => current_time('mysql')
+            ),
+            array('old_token' => $old_token),
+            array('%s', '%s', '%s', '%s', '%s'),
+            array('%s')
+        );
+    } else {
+        // Inserir novo
+        $result = $wpdb->insert(
+            $redirects_table,
+            array(
+                'old_token' => $old_token,
+                'new_url' => $new_url,
+                'new_token' => $new_token,
+                'redirect_type' => $redirect_type,
+                'redirect_count' => 0,
+                'status' => 'active'
+            ),
+            array('%s', '%s', '%s', '%s', '%d', '%s')
+        );
+    }
+    
+    return $result !== false;
+}
+
+// Atualizar contador de redirecionamentos
+function wpfl_update_redirect_count($redirect_id) {
+    global $wpdb;
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $wpdb->query(
+        $wpdb->prepare(
+            "UPDATE $redirects_table SET redirect_count = redirect_count + 1, last_redirect = NOW() WHERE id = %d",
+            $redirect_id
+        )
+    );
+}
+
+// Gerar link local para destino específico
+function wpfl_generate_local_link_for_destination($destination, $type) {
+    $post_id = wpfl_get_random_post_id();
+    if (!$post_id) {
+        return false;
+    }
+    
+    $post = get_post($post_id);
+    $post_title = $post->post_title;
+    
+    $slug_base = sanitize_title($post_title);
+    $random_slug = wpfl_generate_random_slug(13);
+    $final_slug = $slug_base . '-' . $random_slug;
+    $token = bin2hex(random_bytes(8));
+    
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    
+    // Link aponta diretamente para o destino original
+    $result = $wpdb->insert(
+        $table_name,
+        array(
+            'token' => $token,
+            'destino' => $destination, // DESTINO ORIGINAL
+            'tipo' => $type,
+            'post_id' => $post_id,
+            'slug' => $final_slug,
+            'status' => 'active',
+            'is_redirected' => 1, // Marcar como redirecionado
+            'created_at' => current_time('Y-m-d')
+        )
+    );
+    
+    if ($result) {
+        $permalink_structure = get_option('permalink_structure');
+        if (empty($permalink_structure)) {
+            $vsl_url = add_query_arg(array('vsl' => $token), home_url($final_slug));
+        } else {
+            $vsl_url = home_url($final_slug) . '?vsl=' . $token;
+        }
+        
+        return array(
+            'url' => $vsl_url,
+            'token' => $token,
+            'slug' => $final_slug
+        );
+    }
+    
+    return false;
+}
+
+// Marcar token como redirecionado
+function wpfl_mark_token_as_redirected($new_token, $original_token) {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    
+    $wpdb->update(
+        $table_name,
+        array(
+            'is_redirected' => 1,
+            'original_token' => $original_token
+        ),
+        array('token' => $new_token),
+        array('%d', '%s'),
+        array('%s')
+    );
+}
+
+// Registro de configurações
+function wpfl_register_settings() {
+   // Configurações de anúncios
+   register_setting('wpfl_ads_options', 'wpfl_texto_ajuda', 'wpfl_sanitize_html');
+   register_setting('wpfl_ads_options', 'wpfl_ad_above', 'wpfl_sanitize_html');
+   register_setting('wpfl_ads_options', 'wpfl_ad_below', 'wpfl_sanitize_html');
+   register_setting('wpfl_ads_options', 'wpfl_ad_head', 'wpfl_sanitize_html');
+   register_setting('wpfl_ads_options', 'wpfl_ad_fullscreen', 'wpfl_sanitize_html');
+   register_setting('wpfl_ads_options', 'wpfl_ad_invisible', 'wpfl_sanitize_html');
+   
+   // Configurações de responsividade dos anúncios
+   register_setting('wpfl_ads_options', 'wpfl_ad_above_device', 'sanitize_text_field');
+   register_setting('wpfl_ads_options', 'wpfl_ad_below_device', 'sanitize_text_field');
+   register_setting('wpfl_ads_options', 'wpfl_ad_head_device', 'sanitize_text_field');
+   register_setting('wpfl_ads_options', 'wpfl_ad_fullscreen_device', 'sanitize_text_field');
+   register_setting('wpfl_ads_options', 'wpfl_ad_invisible_device', 'sanitize_text_field');
+   
+   // Registro das configurações de personalização visual
+   register_setting('wpfl_visual_options', 'wpfl_click_text', 'sanitize_text_field');
+   register_setting('wpfl_visual_options', 'wpfl_click_auto_time', 'absint');
+   register_setting('wpfl_visual_options', 'wpfl_timer_text', 'sanitize_text_field');
+   register_setting('wpfl_visual_options', 'wpfl_timer_time', 'absint');
+   
+   // Cores e configurações - Forçar Clique
+   register_setting('wpfl_visual_options', 'wpfl_click_bg_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_click_border_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_click_text_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_click_border_width', 'absint');
+   register_setting('wpfl_visual_options', 'wpfl_click_device', 'sanitize_text_field');
+   
+   // Cores e configurações - Cronômetro
+   register_setting('wpfl_visual_options', 'wpfl_timer_bg_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_timer_border_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_timer_text_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_timer_border_width', 'absint');
+   register_setting('wpfl_visual_options', 'wpfl_timer_device', 'sanitize_text_field');
+   
+   // Cores e configurações - Botão
+   register_setting('wpfl_visual_options', 'wpfl_button_bg_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_button_border_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_button_text_color', 'sanitize_hex_color');
+   register_setting('wpfl_visual_options', 'wpfl_button_text', 'sanitize_text_field');
+   register_setting('wpfl_visual_options', 'wpfl_button_border_width', 'absint');
+   register_setting('wpfl_visual_options', 'wpfl_button_device', 'sanitize_text_field');
+}
+add_action('admin_init', 'wpfl_register_settings');
+
+function wpfl_sanitize_html($input) {
+   return $input;
+}
+
+// Shortcodes com responsividade
+function wpfl_texto_ajuda_shortcode() {
+   $content = get_option('wpfl_texto_ajuda');
+   return wpfl_process_code($content);
+}
+add_shortcode('texto_ajuda', 'wpfl_texto_ajuda_shortcode');
+
+function wpfl_ad_above_shortcode() {
+   $content = get_option('wpfl_ad_above');
+   $device = get_option('wpfl_ad_above_device', 'both');
+   return wpfl_apply_device_visibility($content, $device);
+}
+add_shortcode('pg_ad_above', 'wpfl_ad_above_shortcode');
+
+function wpfl_ad_below_shortcode() {
+   $content = get_option('wpfl_ad_below');
+   $device = get_option('wpfl_ad_below_device', 'both');
+   return wpfl_apply_device_visibility($content, $device);
+}
+add_shortcode('pg_ad_below', 'wpfl_ad_below_shortcode');
+
+function wpfl_ad_head_shortcode() {
+   $content = get_option('wpfl_ad_head');
+   $device = get_option('wpfl_ad_head_device', 'both');
+   return wpfl_apply_device_visibility($content, $device);
+}
+add_shortcode('pg_ad_head', 'wpfl_ad_head_shortcode');
+
+function wpfl_ad_fullscreen_shortcode() {
+   $content = get_option('wpfl_ad_fullscreen');
+   $device = get_option('wpfl_ad_fullscreen_device', 'both');
+   return wpfl_apply_device_visibility($content, $device);
+}
+add_shortcode('pg_ad_fullscreen', 'wpfl_ad_fullscreen_shortcode');
+
+function wpfl_ad_invisible_shortcode() {
+  $content = get_option('wpfl_ad_invisible');
+  $device = get_option('wpfl_ad_invisible_device', 'both');
+  return wpfl_apply_device_visibility($content, $device);
+}
+add_shortcode('pg_ad_invisible', 'wpfl_ad_invisible_shortcode');
+
+// Função para aplicar visibilidade por dispositivo
+function wpfl_apply_device_visibility($content, $device) {
+    if (empty($content)) {
+        return '';
+    }
+    
+    $processed_content = wpfl_process_code($content);
+    
+    if ($device === 'mobile') {
+        return '<div class="wpfl-mobile-only">' . $processed_content . '</div>';
+    } elseif ($device === 'desktop') {
+        return '<div class="wpfl-desktop-only">' . $processed_content . '</div>';
+    } else {
+        return $processed_content; // both
+    }
+}
+
+function wpfl_process_code($content) {
+  if (empty($content)) {
+      return '';
+  }
+  return stripslashes($content);
+}
+
+// Enqueue de estilos e scripts
+function wpfl_enqueue_admin_assets($hook) {
+  if (strpos($hook, 'wp_flash_links') === false && strpos($hook, 'wpfl_') === false) {
+      return;
+  }
+  
+  wp_enqueue_style('wpfl-font-awesome', 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css');
+  wp_enqueue_style('wp-color-picker');
+  wp_enqueue_script('wp-color-picker');
+  
+  $css_file = WPFL_PLUGIN_DIR . 'assets/css/style.css';
+  $js_file = WPFL_PLUGIN_DIR . 'assets/js/script.js';
+  
+  if (file_exists($css_file)) {
+      wp_enqueue_style('wpfl-styles', WPFL_PLUGIN_URL . 'assets/css/style.css', array(), WPFL_VERSION);
+  }
+  
+  if (file_exists($js_file)) {
+      wp_enqueue_script('wpfl-script', WPFL_PLUGIN_URL . 'assets/js/script.js', array('jquery', 'wp-color-picker'), WPFL_VERSION, true);
+  }
+  
+  wp_localize_script('wpfl-script', 'wpfl_ajax', array(
+      'api_key' => get_option('wpfl_api_key'),
+      'site_url' => get_site_url(),
+      'nonce' => wp_create_nonce('wp_rest'),
+      'ajax_url' => admin_url('admin-ajax.php')
+  ));
+}
+add_action('admin_enqueue_scripts', 'wpfl_enqueue_admin_assets');
+
+// Adicionar CSS de responsividade no frontend
+function wpfl_enqueue_frontend_styles() {
+    ?>
+    <style>
+    @media (max-width: 768px) {
+        .wpfl-desktop-only { display: none !important; }
+    }
+    @media (min-width: 769px) {
+        .wpfl-mobile-only { display: none !important; }
+    }
+    </style>
+    <?php
+}
+add_action('wp_head', 'wpfl_enqueue_frontend_styles');
+
+// Página principal do plugin
+function wpfl_admin_page() {
+  $api_key = get_option('wpfl_api_key');
+  $site_url = get_site_url();
+  ?>
+  <div class="wrap wpfl-admin-wrap">
+      <h1>WP Flash Links <span style="font-size: 14px; color: #666;">(v3.1.1)</span></h1>
+      
+      <div class="card">
+          <h2>Informações da API</h2>
+          
+          <div class="api-info">
+              <div class="api-item">
+                  <label>Chave API:</label>
+                  <div class="copy-wrapper">
+                      <code><?php echo esc_html($api_key); ?></code>
+                      <button class="copy-btn" data-copy-text="<?php echo esc_attr($api_key); ?>">
+                          <i class="fas fa-copy"></i>
+                      </button>
+                  </div>
+              </div>
+
+              <div class="api-item">
+                  <label>Validar API:</label>
+                  <div class="copy-wrapper">
+                      <code><?php echo esc_html($site_url); ?>/wp-json/wpflashlinks/v1/validar-api</code>
+                      <button class="copy-btn" data-copy-text="<?php echo esc_attr($site_url); ?>/wp-json/wpflashlinks/v1/validar-api">
+                          <i class="fas fa-copy"></i>
+                     </button>
+                 </div>
+             </div>
+
+             <div class="api-item">
+                 <label>Gerar Link VSL:</label>
+                 <div class="copy-wrapper">
+                     <code><?php echo esc_html($site_url); ?>/wp-json/wpflashlinks/v1/gerar-link-vsl</code>
+                     <button class="copy-btn" data-copy-text="<?php echo esc_attr($site_url); ?>/wp-json/wpflashlinks/v1/gerar-link-vsl">
+                         <i class="fas fa-copy"></i>
+                     </button>
+                 </div>
+             </div>
+             
+             <div class="api-item">
+                 <label>Gerar Link (Compatibilidade):</label>
+                 <div class="copy-wrapper">
+                     <code><?php echo esc_html($site_url); ?>/wp-json/wpflashlinks/v1/gerar-link</code>
+                     <button class="copy-btn" data-copy-text="<?php echo esc_attr($site_url); ?>/wp-json/wpflashlinks/v1/gerar-link">
+                         <i class="fas fa-copy"></i>
+                     </button>
+                 </div>
+             </div>
+
+             <div class="api-item">
+                 <label>Status/Estatísticas:</label>
+                 <div class="copy-wrapper">
+                     <code><?php echo esc_html($site_url); ?>/wp-json/wpflashlinks/v1/status</code>
+                     <button class="copy-btn" data-copy-text="<?php echo esc_attr($site_url); ?>/wp-json/wpflashlinks/v1/status">
+                         <i class="fas fa-copy"></i>
+                     </button>
+                 </div>
+             </div>
+         </div>
+     </div>
+
+     <div class="card">
+         <h2>Gerador de Links para Teste</h2>
+         <p class="description">Use esta seção para testar a geração de links. O sistema agora usa tokens e banco de dados (mais eficiente).</p>
+         
+         <form id="pg_form" class="modern-form">
+             <div class="input-group">
+                 <label for="pg_link_fc">
+                     <i class="fas fa-bolt"></i> Forçar Clique
+                 </label>
+                 <div class="input-wrapper">
+                     <input type="url" id="pg_link_fc" name="pg_link_fc" placeholder="Insira seu link aqui" required>
+                     <button type="button" class="button button-primary" onclick="generatePageVSL('click')">
+                         <i class="fas fa-bolt"></i> Gerar Link
+                     </button>
+                 </div>
+             </div>
+             
+             <div class="input-group">
+                 <label for="pg_link_cron">
+                    <i class="fas fa-clock"></i> Cronômetro
+                </label>
+                <div class="input-wrapper">
+                    <input type="url" id="pg_link_cron" name="pg_link_cron" placeholder="Insira seu link aqui" required>
+                    <button type="button" class="button button-primary" onclick="generatePageVSL('timer')">
+                        <i class="fas fa-clock"></i> Gerar Link
+                    </button>
+                </div>
+            </div>
+        </form>
+        <div id="pg_result"></div>
+    </div>
+    
+    <div class="card">
+        <h2>Links Gerados Recentemente</h2>
+        <div id="links_list" class="space-y-4">
+            <?php
+            global $wpdb;
+            $table_name = $wpdb->prefix . 'wpfl_tokens';
+            
+            $recent_links = $wpdb->get_results("
+                SELECT * FROM $table_name 
+                WHERE status = 'active' 
+                ORDER BY created_at DESC 
+                LIMIT 10
+            ");
+
+            if (!empty($recent_links)) {
+                foreach ($recent_links as $link_data) {
+                    $post = get_post($link_data->post_id);
+                    $post_title = $post ? $post->post_title : 'Post não encontrado';
+                    
+                    $permalink_structure = get_option('permalink_structure');
+                    if (empty($permalink_structure)) {
+                        $vsl_url = add_query_arg(array('vsl' => $link_data->token), home_url($link_data->slug));
+                    } else {
+                        $vsl_url = home_url($link_data->slug) . '?vsl=' . $link_data->token;
+                    }
+                    ?>
+                    <div class="link-item bg-card border border-primary rounded-lg p-4" style="border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin: 10px 0;">
+                        <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                            <div class="space-y-2">
+                                <h3 style="margin: 0 0 5px 0; font-weight: bold;"><?php echo esc_html($post_title); ?></h3>
+                                <p style="margin: 5px 0; font-size: 13px; color: #666;">
+                                    <strong>Destino:</strong> 
+                                    <a href="<?php echo esc_url($link_data->destino); ?>" target="_blank" style="color: #0073aa;">
+                                        <?php echo esc_html(substr($link_data->destino, 0, 50) . '...'); ?>
+                                    </a>
+                                </p>
+                                <p style="margin: 5px 0; font-size: 13px; color: #666;">
+                                    <strong>Link Gerado:</strong> 
+                                    <a href="<?php echo esc_url($vsl_url); ?>" target="_blank" style="color: #0073aa;">
+                                        <?php echo esc_html($vsl_url); ?>
+                                    </a>
+                                </p>
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <span style="background: <?php echo $link_data->tipo === 'click' ? '#e3f2fd' : '#e8f5e8'; ?>; color: <?php echo $link_data->tipo === 'click' ? '#1976d2' : '#2e7d32'; ?>; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">
+                                        <?php echo $link_data->tipo === 'click' ? '⚡ Forçar Clique' : '⏱️ Cronômetro'; ?>
+                                    </span>
+                                    <span style="font-size: 11px; color: #999;">
+                                        Token: <?php echo esc_html($link_data->token); ?>
+                                    </span>
+                                    <span style="font-size: 11px; color: #999;">
+                                        <?php echo esc_html($link_data->created_at); ?>
+                                    </span>
+                                    <?php if ($link_data->is_redirected): ?>
+                                        <span style="background: #fff3cd; color: #856404; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">
+                                            🔄 Redirecionado
+                                        </span>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                            <div style="display: flex; gap: 5px;">
+                                <button onclick="copyToClipboard('<?php echo esc_js($vsl_url); ?>')" 
+                                        class="copy-btn" 
+                                        title="Copiar Link"
+                                        style="background: #0073aa; color: white; border: none; padding: 8px 10px; border-radius: 4px; cursor: pointer;">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <?php
+                }
+            } else {
+                echo '<p style="text-align: center; color: #666; padding: 40px;">Nenhum link gerado ainda. Use o formulário acima para testar.</p>';
+            }
+            ?>
+        </div>
+    </div>
+</div>
+
+<script>
+// Função atualizada para usar novo endpoint
+async function generatePageVSL(type) {
+    const button = event.target.closest("button");
+    const originalText = button.innerHTML;
+    const input = type === "click" ? document.getElementById("pg_link_fc") : document.getElementById("pg_link_cron");
+    const link = input.value.trim();
+    
+    if (!link) {
+        alert("Por favor, insira um link válido.");
+        return;
+    }
+    
+    button.innerHTML = "<i class='fas fa-spinner fa-spin'></i> Gerando...";
+    button.disabled = true;
+
+    try {
+        // Usar o endpoint
+        const response = await fetch(wpfl_ajax.site_url + "/wp-json/wpflashlinks/v1/gerar-link-vsl", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-API-Key": wpfl_ajax.api_key,
+                "X-WP-Nonce": wpfl_ajax.nonce
+            },
+            body: JSON.stringify({
+                link: link,
+                tipo: type
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            const resultDiv = document.getElementById("pg_result");
+            resultDiv.innerHTML = `
+                <div class="notice notice-success" style="background: #d4edda; border-left: 4px solid #4CAF50; padding: 15px; margin: 15px 0; border-radius: 4px;">
+                    <p><strong>✅ Link VSL gerado com sucesso!</strong></p>
+                    <div style="background: #f9f9f9; padding: 15px; border-radius: 6px; margin: 10px 0;">
+                        <p><strong>Tipo:</strong> ${type === 'click' ? 'Forçar Clique' : 'Cronômetro'}</p>
+                        <p><strong>Token:</strong> <code>${data.token}</code></p>
+                        <p><strong>Link Gerado:</strong></p>
+                        <div style="display: flex; align-items: center; gap: 10px; margin: 10px 0;">
+                            <code style="word-break: break-all; flex: 1; background: #fff; padding: 8px; border-radius: 4px;">${data.url}</code>
+                            <button class="copy-btn" data-copy-text="${data.url}" style="background: #4CAF50; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer;">
+                                <i class="fas fa-copy"></i> Copiar
+                            </button>
+                        </div>
+                        <p><a href="${data.url}" target="_blank" style="color: #0073aa; text-decoration: none; font-weight: bold;">🔗 Visualizar Link Gerado</a></p>
+                    </div>
+                </div>
+            `;
+            input.value = "";
+            
+            // Recarregar a lista de links após 2 segundos
+            setTimeout(() => {
+                location.reload();
+            }, 2000);
+        } else {
+            throw new Error(data.message || "Erro ao gerar o link VSL.");
+        }
+    } catch (error) {
+        alert("Erro: " + error.message);
+    } finally {
+        button.innerHTML = originalText;
+        button.disabled = false;
+    }
+}
+
+// Função para copiar texto
+async function copyToClipboard(text) {
+    try {
+        if (navigator.clipboard) {
+            await navigator.clipboard.writeText(text);
+        } else {
+            const textarea = document.createElement("textarea");
+            textarea.value = text;
+            textarea.style.position = "fixed";
+            textarea.style.left = "-999999px";
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand("copy");
+            textarea.remove();
+        }
+        
+        // Feedback visual
+        const button = event.target.closest(".copy-btn");
+        const originalHTML = button.innerHTML;
+        button.innerHTML = "<i class='fas fa-check'></i>";
+        button.style.background = "#28a745";
+        
+        setTimeout(() => {
+            button.innerHTML = originalHTML;
+            button.style.background = "";
+        }, 2000);
+        
+        // Notificação
+        const notification = document.createElement("div");
+        notification.style.cssText = "position: fixed; bottom: 20px; right: 20px; background: #4CAF50; color: white; padding: 15px; border-radius: 6px; z-index: 9999; box-shadow: 0 4px 15px rgba(0,0,0,0.2);";
+        notification.textContent = "Link copiado com sucesso!";
+        
+        document.body.appendChild(notification);
+        
+        setTimeout(() => {
+            notification.style.opacity = "0";
+            setTimeout(() => notification.remove(), 300);
+        }, 3000);
+        
+    } catch (err) {
+        alert("Erro ao copiar: " + err.message);
+    }
+}
+</script>
+<?php
+}
+
+// Página de configuração de anúncios
+function wpfl_ads_page() {
+?>
+<div class="wrap wpfl-admin-wrap">
+    <h1>Configurar Anúncios</h1>
+    
+    <div class="notice notice-info is-dismissible">
+        <p><strong>Esta área suporta:</strong></p>
+        <ul style="list-style-type: disc; margin-left: 20px;">
+            <li>HTML - Tags, atributos e estruturas HTML completas</li>
+            <li>CSS - Estilos inline e blocos &lt;style&gt;</li>
+            <li>JavaScript - Códigos e scripts em tags &lt;script&gt;</li>
+            <li>Códigos de redes de anúncios (Google AdSense, Media.net, etc)</li>
+        </ul>
+    </div>
+
+    <form method="post" action="options.php" class="modern-form">
+        <?php 
+        settings_fields('wpfl_ads_options');
+        do_settings_sections('wpfl_ads_options');
+        ?>
+        
+        <div class="card">
+            <h2>Texto de Ajuda</h2>
+            <p class="description">Este texto será exibido logo abaixo do título de cada página gerada.</p>
+            <textarea name="wpfl_texto_ajuda" rows="10" class="large-text code"><?php echo wp_unslash(get_option('wpfl_texto_ajuda')); ?></textarea>
+        </div>
+
+        <div class="card mt-4">
+            <h2><i class="fas fa-arrow-up"></i> Anúncio Acima do Script</h2>
+            <div class="wpfl-device-options">
+                <label><strong>Visibilidade:</strong></label>
+                <div style="margin: 10px 0;">
+                    <label><input type="radio" name="wpfl_ad_above_device" value="both" <?php checked(get_option('wpfl_ad_above_device', 'both'), 'both'); ?>> Ambos os dispositivos</label><br>
+                    <label><input type="radio" name="wpfl_ad_above_device" value="mobile" <?php checked(get_option('wpfl_ad_above_device', 'both'), 'mobile'); ?>> Apenas celular</label><br>
+                    <label><input type="radio" name="wpfl_ad_above_device" value="desktop" <?php checked(get_option('wpfl_ad_above_device', 'both'), 'desktop'); ?>> Apenas computador</label>
+                </div>
+            </div>
+            <textarea name="wpfl_ad_above" rows="10" class="large-text code"><?php echo wp_unslash(get_option('wpfl_ad_above')); ?></textarea>
+        </div>
+
+        <div class="card mt-4">
+            <h2><i class="fas fa-arrow-down"></i> Anúncio Abaixo do Script</h2>
+            <div class="wpfl-device-options">
+                <label><strong>Visibilidade:</strong></label>
+                <div style="margin: 10px 0;">
+                    <label><input type="radio" name="wpfl_ad_below_device" value="both" <?php checked(get_option('wpfl_ad_below_device', 'both'), 'both'); ?>> Ambos os dispositivos</label><br>
+                    <label><input type="radio" name="wpfl_ad_below_device" value="mobile" <?php checked(get_option('wpfl_ad_below_device', 'both'), 'mobile'); ?>> Apenas celular</label><br>
+                    <label><input type="radio" name="wpfl_ad_below_device" value="desktop" <?php checked(get_option('wpfl_ad_below_device', 'both'), 'desktop'); ?>> Apenas computador</label>
+                </div>
+            </div>
+            <textarea name="wpfl_ad_below" rows="10" class="large-text code"><?php echo wp_unslash(get_option('wpfl_ad_below')); ?></textarea>
+        </div>
+
+        <div class="card mt-4">
+            <h2><i class="fas fa-eye-slash"></i> Anúncios Invisíveis</h2>
+            <p class="description">Códigos que serão inseridos no &lt;head&gt; da página (ex: Google AdSense Auto Ads, Facebook Pixel, etc).</p>
+            <div class="wpfl-device-options">
+                <label><strong>Visibilidade:</strong></label>
+                <div style="margin: 10px 0;">
+                    <label><input type="radio" name="wpfl_ad_head_device" value="both" <?php checked(get_option('wpfl_ad_head_device', 'both'), 'both'); ?>> Ambos os dispositivos</label><br>
+                    <label><input type="radio" name="wpfl_ad_head_device" value="mobile" <?php checked(get_option('wpfl_ad_head_device', 'both'), 'mobile'); ?>> Apenas celular</label><br>
+                    <label><input type="radio" name="wpfl_ad_head_device" value="desktop" <?php checked(get_option('wpfl_ad_head_device', 'both'), 'desktop'); ?>> Apenas computador</label>
+                </div>
+            </div>
+            <textarea name="wpfl_ad_head" rows="10" class="large-text code"><?php echo wp_unslash(get_option('wpfl_ad_head')); ?></textarea>
+        </div>
+
+        <div class="card mt-4">
+            <h2><i class="fas fa-expand"></i> Anúncios Tela Inteira</h2>
+            <p class="description">Anúncios que ocupam a tela inteira (ex: interstitials, pop-ups, etc).</p>
+            <div class="wpfl-device-options">
+                <label><strong>Visibilidade:</strong></label>
+                <div style="margin: 10px 0;">
+                    <label><input type="radio" name="wpfl_ad_fullscreen_device" value="both" <?php checked(get_option('wpfl_ad_fullscreen_device', 'both'), 'both'); ?>> Ambos os dispositivos</label><br>
+                    <label><input type="radio" name="wpfl_ad_fullscreen_device" value="mobile" <?php checked(get_option('wpfl_ad_fullscreen_device', 'both'), 'mobile'); ?>> Apenas celular</label><br>
+                    <label><input type="radio" name="wpfl_ad_fullscreen_device" value="desktop" <?php checked(get_option('wpfl_ad_fullscreen_device', 'both'), 'desktop'); ?>> Apenas computador</label>
+                </div>
+            </div>
+            <textarea name="wpfl_ad_fullscreen" rows="10" class="large-text code"><?php echo wp_unslash(get_option('wpfl_ad_fullscreen')); ?></textarea>
+        </div>
+
+       <?php submit_button('Salvar Configurações', 'primary', 'submit', false, array('style' => 'margin-top: 15px;')); ?>
+    </form>
+</div>
+<?php
+}
+
+// Página para selecionar posts
+function wpfl_posts_selector_page() {
+    if (isset($_POST['wpfl_save_posts'])) {
+        check_admin_referer('wpfl_save_posts_nonce');
+        $selected_posts = isset($_POST['selected_posts']) ? array_map('intval', $_POST['selected_posts']) : array();
+        update_option('wpfl_selected_posts', $selected_posts);
+        echo '<div class="notice notice-success is-dismissible"><p>Seleção de posts salva com sucesso!</p></div>';
+    }
+
+    $selected_posts = get_option('wpfl_selected_posts', array());
+
+    $args = array(
+        'post_type' => 'post',
+        'post_status' => 'publish',
+        'posts_per_page' => -1,
+        'orderby' => 'date',
+        'order' => 'DESC'
+    );
+    $posts_query = new WP_Query($args);
+    ?>
+    <div class="wrap wpfl-admin-wrap">
+        <h1>Selecionar Posts para Geração de Links</h1>
+        
+        <form method="post" action="" id="wpfl-posts-form">
+            <?php wp_nonce_field('wpfl_save_posts_nonce'); ?>
+            <input type="hidden" name="wpfl_save_posts" value="1">
+            
+            <div class="card">
+                <h2>Selecione os Posts</h2>
+                <p>Selecione os posts que serão usados para gerar links. Se nenhum for selecionado, qualquer post publicado poderá ser usado.</p>
+                
+                <div class="wpfl-posts-container" style="margin-top: 20px;">
+                    <div class="wpfl-actions" style="margin-bottom: 20px;">
+                        <button type="button" id="wpflSelectAll" class="button">Selecionar Todos</button>
+                        <button type="button" id="wpflDeselectAll" class="button">Desmarcar Todos</button>
+                        <span class="wpfl-counter" id="wpfl-counter" style="margin-left: 15px; font-style: italic;">
+                            <?php echo count($selected_posts); ?> posts selecionados de <?php echo $posts_query->found_posts; ?> total
+                        </span>
+                    </div>
+                    
+                    <?php if ($posts_query->have_posts()) : ?>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px;">
+                            <?php while ($posts_query->have_posts()) : $posts_query->the_post(); ?>
+                                <div class="wpfl-post-card" style="border: 1px solid #ddd; padding: 15px; border-radius: 8px;">
+                                    <label style="display: flex; align-items: center; cursor: pointer;">
+                                        <input type="checkbox" name="selected_posts[]" value="<?php echo get_the_ID(); ?>" 
+                                            <?php checked(in_array(get_the_ID(), $selected_posts)); ?> 
+                                            class="wpfl-post-checkbox" style="margin-right: 10px;">
+                                        <div>
+                                            <h4 style="margin: 0 0 5px 0;"><?php the_title(); ?></h4>
+                                            <small style="color: #666;"><?php echo get_the_date(); ?></small>
+                                        </div>
+                                    </label>
+                                </div>
+                            <?php endwhile; ?>
+                        </div>
+                    <?php else : ?>
+                        <p>Nenhum post encontrado.</p>
+                    <?php endif; ?>
+                    <?php wp_reset_postdata(); ?>
+                </div>
+            </div>
+            
+            <?php submit_button('Salvar Seleção', 'primary', 'submit', false, array('style' => 'margin-top: 20px;')); ?>
+        </form>
+    </div>
+
+    <script type="text/javascript">
+    jQuery(document).ready(function($) {
+        function updateCounter() {
+            var totalSelected = $('.wpfl-post-checkbox:checked').length;
+            var totalPosts = $('.wpfl-post-checkbox').length;
+            $('#wpfl-counter').text(totalSelected + ' posts selecionados de ' + totalPosts + ' total');
+        }
+
+        $('#wpflSelectAll').on('click', function(e) {
+            e.preventDefault();
+            $('.wpfl-post-checkbox').prop('checked', true);
+            updateCounter();
+        });
+
+        $('#wpflDeselectAll').on('click', function(e) {
+            e.preventDefault();
+            $('.wpfl-post-checkbox').prop('checked', false);
+            updateCounter();
+        });
+
+        $(document).on('change', '.wpfl-post-checkbox', function() {
+            updateCounter();
+        });
+
+        updateCounter();
+    });
+    </script>
+    <?php
+}
+
+// Página de Personalização Visual
+function wpfl_visual_customization_page() {
+    ?>
+    <div class="wrap wpfl-admin-wrap">
+        <h1><i class="fas fa-paint-brush"></i> Personalização Visual</h1>
+        
+        <div class="notice notice-info is-dismissible">
+            <p><strong>Configure a aparência:</strong> Personalize cores, textos, tempos e visibilidade por dispositivo dos elementos de bloqueio e cronômetro.</p>
+        </div>
+
+        <form method="post" action="options.php" class="modern-form">
+            <?php 
+            settings_fields('wpfl_visual_options');
+            do_settings_sections('wpfl_visual_options');
+            ?>
+            
+            <!-- Configurações do Forçar Clique -->
+            <div class="card">
+                <h2><i class="fas fa-bolt"></i> Configurações do Forçar Clique</h2>
+                
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">Texto de Bloqueio</th>
+                        <td>
+                            <textarea name="wpfl_click_text" rows="3" class="large-text"><?php echo esc_textarea(get_option('wpfl_click_text', '⚠️ CLIQUE NO ANÚNCIO ACIMA PARA DESBLOQUEAR, ESPERE 15 SEGUNDOS NA PÁGINA DEPOIS VOLTE ⚠️')); ?></textarea>
+                            <p class="description">Mensagem exibida enquanto o conteúdo está bloqueado.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Tempo de Liberação Automática</th>
+                        <td>
+                            <input type="number" name="wpfl_click_auto_time" value="<?php echo esc_attr(get_option('wpfl_click_auto_time', 40)); ?>" min="10" max="300" class="small-text"> segundos
+                            <p class="description">Tempo em segundos para liberar automaticamente o conteúdo.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Visibilidade por Dispositivo</th>
+                        <td>
+                            <div class="wpfl-device-options">
+                                <label><input type="radio" name="wpfl_click_device" value="both" <?php checked(get_option('wpfl_click_device', 'both'), 'both'); ?>> Ambos os dispositivos</label><br>
+                                <label><input type="radio" name="wpfl_click_device" value="mobile" <?php checked(get_option('wpfl_click_device', 'both'), 'mobile'); ?>> Apenas celular</label><br>
+                                <label><input type="radio" name="wpfl_click_device" value="desktop" <?php checked(get_option('wpfl_click_device', 'both'), 'desktop'); ?>> Apenas computador</label>
+                            </div>
+                            <p class="description">Escolha em quais dispositivos o bloqueio será exibido.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor de Fundo do Overlay</th>
+                        <td>
+                            <input type="text" name="wpfl_click_bg_color" value="<?php echo esc_attr(get_option('wpfl_click_bg_color', '#000000')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor de fundo do overlay de bloqueio.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor da Borda</th>
+                        <td>
+                            <input type="text" name="wpfl_click_border_color" value="<?php echo esc_attr(get_option('wpfl_click_border_color', '#e3e3e3')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor da borda do container de bloqueio.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Largura da Borda</th>
+                        <td>
+                            <input type="number" name="wpfl_click_border_width" value="<?php echo esc_attr(get_option('wpfl_click_border_width', 2)); ?>" min="0" max="10" class="small-text"> pixels
+                            <p class="description">Espessura da borda em pixels.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor do Texto</th>
+                        <td>
+                            <input type="text" name="wpfl_click_text_color" value="<?php echo esc_attr(get_option('wpfl_click_text_color', '#ffffff')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor do texto da mensagem de bloqueio.</p>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+
+            <!-- Configurações do Cronômetro -->
+            <div class="card mt-4">
+                <h2><i class="fas fa-clock"></i> Configurações do Cronômetro</h2>
+                
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">Texto do Cronômetro</th>
+                        <td>
+                            <input type="text" name="wpfl_timer_text" value="<?php echo esc_attr(get_option('wpfl_timer_text', '⏳ Por favor, aguarde para continuar...')); ?>" class="large-text">
+                            <p class="description">Mensagem exibida durante a contagem regressiva.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Tempo do Cronômetro</th>
+                        <td>
+                            <input type="number" name="wpfl_timer_time" value="<?php echo esc_attr(get_option('wpfl_timer_time', 30)); ?>" min="5" max="300" class="small-text"> segundos
+                            <p class="description">Tempo em segundos da contagem regressiva.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Visibilidade por Dispositivo</th>
+                        <td>
+                            <div class="wpfl-device-options">
+                                <label><input type="radio" name="wpfl_timer_device" value="both" <?php checked(get_option('wpfl_timer_device', 'both'), 'both'); ?>> Ambos os dispositivos</label><br>
+                                <label><input type="radio" name="wpfl_timer_device" value="mobile" <?php checked(get_option('wpfl_timer_device', 'both'), 'mobile'); ?>> Apenas celular</label><br>
+                                <label><input type="radio" name="wpfl_timer_device" value="desktop" <?php checked(get_option('wpfl_timer_device', 'both'), 'desktop'); ?>> Apenas computador</label>
+                            </div>
+                            <p class="description">Escolha em quais dispositivos o cronômetro será exibido.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor de Fundo</th>
+                        <td>
+                            <input type="text" name="wpfl_timer_bg_color" value="<?php echo esc_attr(get_option('wpfl_timer_bg_color', '#f0f0f0')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor de fundo do container do cronômetro.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor da Borda</th>
+                        <td>
+                            <input type="text" name="wpfl_timer_border_color" value="<?php echo esc_attr(get_option('wpfl_timer_border_color', '#e3e3e3')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor da borda do container do cronômetro.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Largura da Borda</th>
+                        <td>
+                            <input type="number" name="wpfl_timer_border_width" value="<?php echo esc_attr(get_option('wpfl_timer_border_width', 1)); ?>" min="0" max="10" class="small-text"> pixels
+                            <p class="description">Espessura da borda em pixels.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor do Texto/Números</th>
+                        <td>
+                            <input type="text" name="wpfl_timer_text_color" value="<?php echo esc_attr(get_option('wpfl_timer_text_color', '#2563eb')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor do texto e números do cronômetro.</p>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+
+            <!-- Configurações do Botão -->
+            <div class="card mt-4">
+                <h2><i class="fas fa-hand-pointer"></i> Configurações do Botão de Redirecionamento</h2>
+                
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">Texto do Botão</th>
+                        <td>
+                            <input type="text" name="wpfl_button_text" value="<?php echo esc_attr(get_option('wpfl_button_text', 'CONTINUAR PARA O CONTEÚDO ➜')); ?>" class="large-text">
+                            <p class="description">Texto exibido no botão após o desbloqueio.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Visibilidade por Dispositivo</th>
+                        <td>
+                            <div class="wpfl-device-options">
+                                <label><input type="radio" name="wpfl_button_device" value="both" <?php checked(get_option('wpfl_button_device', 'both'), 'both'); ?>> Ambos os dispositivos</label><br>
+                                <label><input type="radio" name="wpfl_button_device" value="mobile" <?php checked(get_option('wpfl_button_device', 'both'), 'mobile'); ?>> Apenas celular</label><br>
+                                <label><input type="radio" name="wpfl_button_device" value="desktop" <?php checked(get_option('wpfl_button_device', 'both'), 'desktop'); ?>> Apenas computador</label>
+                            </div>
+                            <p class="description">Escolha em quais dispositivos o botão será exibido.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor de Fundo</th>
+                        <td>
+                            <input type="text" name="wpfl_button_bg_color" value="<?php echo esc_attr(get_option('wpfl_button_bg_color', '#4CAF50')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor de fundo do botão.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor da Borda</th>
+                        <td>
+                            <input type="text" name="wpfl_button_border_color" value="<?php echo esc_attr(get_option('wpfl_button_border_color', '#45a049')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor da borda do botão.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Largura da Borda</th>
+                        <td>
+                            <input type="number" name="wpfl_button_border_width" value="<?php echo esc_attr(get_option('wpfl_button_border_width', 2)); ?>" min="0" max="10" class="small-text"> pixels
+                            <p class="description">Espessura da borda em pixels.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Cor do Texto</th>
+                        <td>
+                            <input type="text" name="wpfl_button_text_color" value="<?php echo esc_attr(get_option('wpfl_button_text_color', '#ffffff')); ?>" class="wpfl-color-picker">
+                            <p class="description">Cor do texto do botão.</p>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+
+            <?php submit_button('Salvar Personalização', 'primary', 'submit', false, array('style' => 'margin-top: 15px;')); ?>
+        </form>
+    </div>
+
+    <script type="text/javascript">
+    jQuery(document).ready(function($) {
+        $('.wpfl-color-picker').wpColorPicker();
+    });
+    </script>
+    <?php
+}
+
+// SISTEMA DE REDIRECIONAMENTO - Página Principal (COMPLETA)
+function wpfl_redirects_page() {
+    global $wpdb;
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $total_redirects = $wpdb->get_var("SELECT COUNT(*) FROM $redirects_table WHERE status = 'active'");
+    if (!$total_redirects) $total_redirects = 0;
+    
+    $recent_redirects = $wpdb->get_results("
+        SELECT * FROM $redirects_table 
+        WHERE status = 'active' 
+        ORDER BY created_at DESC 
+        LIMIT 10
+    ");
+    ?>
+    <div class="wrap wpfl-admin-wrap">
+        <h1>Sistema de Redirecionamento <span style="font-size: 14px; color: #666;">(v3.1.1)</span></h1>
+        
+        <div class="notice notice-info is-dismissible">
+            <p><strong>Como usar o Sistema:</strong></p>
+            <ol style="margin-left: 20px;">
+                <li><strong>Site A (Antigo):</strong> Exporta destinos dos links existentes</li>
+                <li><strong>Site B (Atual):</strong> Importa destinos + gera links locais (em lotes)</li>
+                <li><strong>Site B:</strong> Exporta mapeamento de redirecionamentos</li>
+                <li><strong>Site A:</strong> Importa redirecionamentos para ativar o sistema</li>
+                <li><strong>Resultado:</strong> Site A → Site B (destino original) automaticamente</li>
+            </ol>
+        </div>
+        
+        <div class="wpfl-tabs-container">
+            <div class="wpfl-tab-header">
+                <button type="button" class="wpfl-tab-btn active" data-tab="export-tab">
+                    <i class="fas fa-download"></i> 1. Exportar Destinos
+                </button>
+                <button type="button" class="wpfl-tab-btn" data-tab="import-tab">
+                    <i class="fas fa-upload"></i> 2. Importar em Lotes
+                </button>
+                <button type="button" class="wpfl-tab-btn" data-tab="export-redirects-tab">
+                    <i class="fas fa-share"></i> 3. Exportar Redirecionamentos
+                </button>
+                <button type="button" class="wpfl-tab-btn" data-tab="import-redirects-tab">
+                    <i class="fas fa-cogs"></i> 4. Importar para Redirecionamento
+                </button>
+                <button type="button" class="wpfl-tab-btn" data-tab="manage-tab">
+                    <i class="fas fa-list"></i> Gerenciar
+                </button>
+            </div>
+            
+            <!-- ABA 1: Exportar Destinos -->
+            <div class="wpfl-tab-content active" id="export-tab">
+                <div class="card">
+                    <h2><i class="fas fa-download"></i> 1. Exportar Destinos dos Links</h2>
+                    <p>Esta função gera um arquivo JSON com todos os destinos dos links ativos deste site.</p>
+                    
+                    <?php
+                    $tokens_table = $wpdb->prefix . 'wpfl_tokens';
+                    $total_tokens = $wpdb->get_var("SELECT COUNT(*) FROM $tokens_table WHERE status = 'active'");
+                    if (!$total_tokens) $total_tokens = 0;
+                    ?>
+                    
+                    <div style="background: #f9f9f9; padding: 20px; border-radius: 8px; text-align: center; margin: 20px 0;">
+                        <h3>Links Disponíveis para Exportar</h3>
+                        <p style="font-size: 2em; font-weight: bold; color: #0073aa; margin: 10px 0;"><?php echo number_format($total_tokens); ?></p>
+                        <small>Links ativos neste site</small>
+                    </div>
+                    
+                    <div class="wpfl-export-actions">
+                        <button id="wpfl-export-destinations-btn" class="button button-primary button-large">
+                            <i class="fas fa-download"></i> Gerar e Baixar Arquivo de Destinos
+                        </button>
+                        <p class="description">O arquivo conterá apenas os destinos dos links, preservando tokens e tipos.</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- ABA 2: Importar Destinos -->
+            <div class="wpfl-tab-content" id="import-tab">
+                <div class="card">
+                    <h2><i class="fas fa-upload"></i> 2. Importar Destinos e Gerar Links Locais (EM LOTES)</h2>
+                    <p><strong>PROCESSAMENTO EM LOTES:</strong> Links locais apontam diretamente para os destinos originais. Processamento em lotes para evitar sobrecarga.</p>
+                    
+                    <form id="wpfl-import-destinations-form" enctype="multipart/form-data">
+                        <div style="margin: 25px 0; padding: 20px; background: #f9f9f9; border-radius: 8px;">
+                            <h3><i class="fas fa-file-upload"></i> Selecionar Arquivo</h3>
+                            <input type="file" id="wpfl-import-destinations-file" name="import_file" accept=".json" required>
+                            <p class="description">Selecione o arquivo JSON exportado do site anterior.</p>
+                        </div>
+                        
+                        <div style="margin: 25px 0; padding: 20px; background: #e8f5e8; border-radius: 8px;">
+                            <h3><i class="fas fa-layer-group"></i> Configuração de Lotes</h3>
+                            <div style="display: flex; gap: 15px; align-items: center; margin: 15px 0;">
+                                <label><strong>Tamanho do Lote:</strong></label>
+                                <select id="wpfl-batch-size" name="batch_size" style="padding: 5px;">
+                                    <option value="100" selected>100 links por lote</option>
+                                    <option value="500">500 links por lote</option>
+                                    <option value="1000">1000 links por lote</option>
+                                </select>
+                            </div>
+                            <p class="description">Escolha quantos links processar por vez. Lotes menores são mais seguros.</p>
+                        </div>
+                        
+                        <div class="wpfl-import-actions">
+                            <button type="submit" class="button button-primary button-large">
+                                <i class="fas fa-cogs"></i> Iniciar Importação em Lotes
+                            </button>
+                        </div>
+                    </form>
+                    
+                    <div id="wpfl-import-progress-container" style="display: none;">
+                        <div class="wpfl-progress-info">
+                            <h3>Processando Importação em Lotes...</h3>
+                            <div style="width: 100%; height: 20px; background: #f0f0f0; border-radius: 10px; margin: 15px 0;">
+                                <div id="wpfl-import-progress-fill" style="height: 100%; background: linear-gradient(90deg, #0073aa, #00a0d2); width: 0%; transition: width 0.3s ease; border-radius: 10px;"></div>
+                            </div>
+                            <p id="wpfl-import-progress-text">Preparando...</p>
+                            <div id="wpfl-import-stats" style="margin-top: 15px; padding: 10px; background: #fff; border-radius: 5px;">
+                                <p><strong>Lote Atual:</strong> <span id="current-batch">0</span> de <span id="total-batches">0</span></p>
+                                <p><strong>Links Processados:</strong> <span id="processed-links">0</span> de <span id="total-links">0</span></p>
+                                <p><strong>Sucessos:</strong> <span id="success-count">0</span> | <strong>Erros:</strong> <span id="error-count">0</span></p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- ABA 3: Exportar Links para Redirecionamento -->
+            <div class="wpfl-tab-content" id="export-redirects-tab">
+                <div class="card">
+                    <h2><i class="fas fa-share"></i> 3. Exportar Links para Redirecionamento</h2>
+                    <p>Após importar destinos e gerar links locais, exporte estes links para configurar redirecionamentos no site anterior.</p>
+                    
+                    <div style="background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                        <h4 style="margin-top: 0;"><i class="fas fa-info-circle"></i> Quando usar esta função:</h4>
+                        <ul style="margin-bottom: 0;">
+                            <li>Após importar destinos na aba anterior</li>
+                            <li>Quando quiser que o site anterior redirecione para este site</li>
+                            <li>Para completar a cadeia de redirecionamentos</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="wpfl-export-actions">
+                        <button id="wpfl-export-redirects-btn" class="button button-primary button-large">
+                            <i class="fas fa-share"></i> Gerar Arquivo de Redirecionamentos
+                        </button>
+                        <p class="description">Este arquivo mapeará tokens antigos para os novos links deste site.</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- ABA 4: Importar Redirecionamentos -->
+            <div class="wpfl-tab-content" id="import-redirects-tab">
+                <div class="card">
+                    <h2><i class="fas fa-cogs"></i> 4. Importar Redirecionamentos (Site Anterior)</h2>
+                    <p>Use esta função no <strong>site anterior</strong> para ativar redirecionamentos automáticos para este site.</p>
+                    
+                    <div style="background: #d1ecf1; border: 1px solid #b8daff; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                        <h4 style="margin-top: 0;"><i class="fas fa-lightbulb"></i> Como funciona:</h4>
+                        <ol style="margin-bottom: 0;">
+                            <li>O site atual gera arquivo na aba anterior</li>
+                            <li>Você baixa o arquivo</li>
+                            <li>Vai para o site ANTERIOR</li>
+                            <li>Usa esta aba para importar o arquivo</li>
+                            <li>Redirecionamentos ficam ativos automaticamente</li>
+                        </ol>
+                    </div>
+                    
+                    <form id="wpfl-import-redirects-form" enctype="multipart/form-data">
+                        <div style="margin: 25px 0; padding: 20px; background: #f9f9f9; border-radius: 8px;">
+                            <h3><i class="fas fa-file-upload"></i> Arquivo de Redirecionamentos</h3>
+                            <input type="file" id="wpfl-import-redirects-file" name="redirects_file" accept=".json" required>
+                            <p class="description">Selecione o arquivo JSON de redirecionamentos gerado pelo site de destino.</p>
+                        </div>
+                        
+                        <div class="wpfl-import-actions">
+                            <button type="submit" class="button button-primary button-large">
+                                <i class="fas fa-play"></i> Ativar Redirecionamentos
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            
+            <!-- ABA 5: Gerenciar Redirecionamentos -->
+            <div class="wpfl-tab-content" id="manage-tab">
+                <div class="card">
+                    <h2><i class="fas fa-list"></i> Redirecionamentos Ativos</h2>
+                    
+                    <div style="background: #f9f9f9; padding: 20px; border-radius: 8px; text-align: center; margin: 20px 0;">
+                        <h3>Total de Redirecionamentos</h3>
+                        <p style="font-size: 2em; font-weight: bold; color: #0073aa; margin: 10px 0;"><?php echo number_format($total_redirects); ?></p>
+                    </div>
+                    
+                    <?php if (!empty($recent_redirects)): ?>
+                        <table class="widefat striped" style="margin-top: 20px;">
+                            <thead>
+                                <tr>
+                                    <th>Token Antigo</th>
+                                    <th>Novo URL</th>
+                                    <th>Tipo</th>
+                                    <th>Redirecionamentos</th>
+                                    <th>Último Acesso</th>
+                                    <th>Status</th>
+                                    <th>Ações</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($recent_redirects as $redirect): ?>
+                                <tr>
+                                    <td><code><?php echo esc_html($redirect->old_token); ?></code></td>
+                                    <td>
+                                        <a href="<?php echo esc_url($redirect->new_url); ?>" target="_blank">
+                                            <?php echo esc_html(substr($redirect->new_url, 0, 50) . '...'); ?>
+                                        </a>
+                                    </td>
+                                    <td>
+                                        <span style="background: #e3f2fd; color: #1976d2; padding: 2px 6px; border-radius: 3px; font-size: 11px;">
+                                            <?php echo esc_html($redirect->redirect_type); ?>
+                                        </span>
+                                    </td>
+                                    <td><?php echo number_format($redirect->redirect_count); ?></td>
+                                    <td><?php echo $redirect->last_redirect ? date_i18n(get_option('date_format') . ' H:i', strtotime($redirect->last_redirect)) : 'Nunca'; ?></td>
+                                    <td>
+                                        <span style="padding: 4px 8px; border-radius: 4px; font-size: 12px; background: #d4edda; color: #155724;">
+                                            <?php echo ucfirst($redirect->status); ?>
+                                        </span>
+                                    </td>
+                                    <td>
+                                       <button class="wpfl-toggle-redirect button button-small" data-id="<?php echo $redirect->id; ?>" data-status="<?php echo $redirect->status; ?>">
+                                            <?php echo $redirect->status === 'active' ? 'Desativar' : 'Ativar'; ?>
+                                        </button>
+                                    </td>
+                                </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                        
+                        <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
+                            <button id="wpfl-clear-all-redirects" class="button button-secondary">
+                                <i class="fas fa-trash"></i> Limpar Todos os Redirecionamentos
+                            </button>
+                        </div>
+                    <?php else: ?>
+                        <div style="text-align: center; padding: 60px 20px; color: #666;">
+                            <div style="font-size: 4em; margin-bottom: 20px; opacity: 0.3;">
+                                <i class="fas fa-route"></i>
+                            </div>
+                            <h3>Nenhum redirecionamento configurado</h3>
+                            <p>Use as abas acima para configurar o sistema de redirecionamento entre sites.</p>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <style>
+    .wpfl-tabs-container { margin: 20px 0; }
+    .wpfl-tab-header { display: flex; border-bottom: 2px solid #ddd; margin-bottom: 20px; gap: 5px; flex-wrap: wrap; }
+    .wpfl-tab-btn { padding: 12px 15px; border: none; background: #f0f0f0; cursor: pointer; border-radius: 5px 5px 0 0; font-size: 13px; }
+    .wpfl-tab-btn.active { background: #0073aa; color: white; }
+    .wpfl-tab-content { display: none; }
+    .wpfl-tab-content.active { display: block; }
+    .wpfl-progress-info h3 { color: #0073aa; }
+    </style>
+    
+    <script>
+    jQuery(document).ready(function($) {
+        // Tab switching
+        $('.wpfl-tab-btn').click(function() {
+            const targetTab = $(this).data('tab');
+            $('.wpfl-tab-btn').removeClass('active');
+            $('.wpfl-tab-content').removeClass('active');
+            $(this).addClass('active');
+            $('#' + targetTab).addClass('active');
+        });
+        
+        // Export destinations
+        $('#wpfl-export-destinations-btn').click(function() {
+            $(this).prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Gerando...');
+            
+            $.post(ajaxurl, {
+                action: 'wpfl_export_destinations',
+                nonce: '<?php echo wp_create_nonce('wpfl_export_destinations_nonce'); ?>'
+            }, function(response) {
+                if (response.success) {
+                    const blob = new Blob([JSON.stringify(response.data, null, 2)], { type: 'application/json' });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'wpfl_destinos_' + new Date().getTime() + '.json';
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(a);
+                    alert('Arquivo de destinos exportado com sucesso!');
+                } else {
+                    alert('Erro ao exportar: ' + response.data);
+                }
+            }).always(function() {
+                $('#wpfl-export-destinations-btn').prop('disabled', false).html('<i class="fas fa-download"></i> Gerar e Baixar Arquivo de Destinos');
+            });
+        });
+        
+        // Import destinations with batch processing
+        $('#wpfl-import-destinations-form').submit(function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            formData.append('action', 'wpfl_import_destinations_batch');
+            formData.append('nonce', '<?php echo wp_create_nonce('wpfl_import_destinations_nonce'); ?>');
+            
+            $('#wpfl-import-progress-container').show();
+            const $progressFill = $('#wpfl-import-progress-fill');
+            const $progressText = $('#wpfl-import-progress-text');
+            
+            // Reset counters
+            $('#current-batch').text('0');
+            $('#total-batches').text('0');
+            $('#processed-links').text('0');
+            $('#total-links').text('0');
+            $('#success-count').text('0');
+            $('#error-count').text('0');
+            
+            $.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: formData,
+                processData: false,
+                contentType: false,
+                success: function(response) {
+                    if (response.success) {
+                        // Start batch processing
+                        processBatches(response.data);
+                    } else {
+                        alert('Erro na importação: ' + response.data);
+                        $('#wpfl-import-progress-container').hide();
+                    }
+                },
+                error: function() {
+                    alert('Erro na comunicação com o servidor.');
+                    $('#wpfl-import-progress-container').hide();
+                }
+            });
+        });
+        
+        // Process batches function
+        function processBatches(batchData) {
+            const totalBatches = batchData.total_batches;
+            let currentBatch = 0;
+            let totalProcessed = 0;
+            let totalSuccess = 0;
+            let totalErrors = 0;
+            
+            $('#total-batches').text(totalBatches);
+            $('#total-links').text(batchData.total_items);
+            
+            function processBatch(batchIndex) {
+                if (batchIndex >= totalBatches) {
+                    // Completed
+                    $('#wpfl-import-progress-fill').css('width', '100%');
+                    $('#wpfl-import-progress-text').text('Importação concluída!');
+                    setTimeout(function() {
+                        alert(`Importação concluída! ${totalSuccess} links criados, ${totalErrors} erros.`);
+                        location.reload();
+                    }, 1000);
+                    return;
+                }
+                
+                currentBatch = batchIndex + 1;
+                $('#current-batch').text(currentBatch);
+                $('#wpfl-import-progress-text').text(`Processando lote ${currentBatch} de ${totalBatches}...`);
+                
+                // Update progress bar
+                const progress = (currentBatch / totalBatches) * 100;
+                $('#wpfl-import-progress-fill').css('width', progress + '%');
+                
+                $.post(ajaxurl, {
+                    action: 'wpfl_process_batch',
+                    batch_index: batchIndex,
+                    batch_id: batchData.batch_id,
+                    nonce: '<?php echo wp_create_nonce('wpfl_process_batch_nonce'); ?>'
+                }, function(response) {
+                    if (response.success) {
+                        totalProcessed += response.data.processed;
+                        totalSuccess += response.data.success;
+                        totalErrors += response.data.errors;
+                        
+                        $('#processed-links').text(totalProcessed);
+                        $('#success-count').text(totalSuccess);
+                        $('#error-count').text(totalErrors);
+                        
+                        // Process next batch
+                        setTimeout(function() {
+                            processBatch(batchIndex + 1);
+                        }, 500);
+                    } else {
+                        alert('Erro no lote ' + currentBatch + ': ' + response.data);
+                        $('#wpfl-import-progress-container').hide();
+                    }
+                }).fail(function() {
+                    alert('Erro de comunicação no lote ' + currentBatch);
+                    $('#wpfl-import-progress-container').hide();
+                });
+            }
+            
+            // Start processing
+            processBatch(0);
+        }
+        
+        // Export redirects
+        $('#wpfl-export-redirects-btn').click(function() {
+            $(this).prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Gerando...');
+            
+            $.post(ajaxurl, {
+                action: 'wpfl_export_redirects',
+                nonce: '<?php echo wp_create_nonce('wpfl_export_redirects_nonce'); ?>'
+            }, function(response) {
+                if (response.success) {
+                    const blob = new Blob([JSON.stringify(response.data, null, 2)], { type: 'application/json' });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'wpfl_redirecionamentos_' + new Date().getTime() + '.json';
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(a);
+                    alert('Arquivo de redirecionamentos exportado com sucesso!');
+                } else {
+                    alert('Erro ao exportar: ' + response.data);
+                }
+            }).always(function() {
+                $('#wpfl-export-redirects-btn').prop('disabled', false).html('<i class="fas fa-share"></i> Gerar Arquivo de Redirecionamentos');
+            });
+        });
+        
+        // Import redirects
+        $('#wpfl-import-redirects-form').submit(function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            formData.append('action', 'wpfl_import_redirects');
+            formData.append('nonce', '<?php echo wp_create_nonce('wpfl_import_redirects_nonce'); ?>');
+            
+            $.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: formData,
+                processData: false,
+                contentType: false,
+                success: function(response) {
+                    if (response.success) {
+                        alert('Redirecionamentos ativados com sucesso! ' + response.data.activated + ' redirecionamentos configurados.');
+                        location.reload();
+                    } else {
+                        alert('Erro ao ativar redirecionamentos: ' + response.data);
+                    }
+                },
+                error: function() {
+                    alert('Erro na comunicação com o servidor.');
+                }
+            });
+        });
+        
+        // Toggle redirect status
+        $(document).on('click', '.wpfl-toggle-redirect', function(e) {
+            e.preventDefault();
+            
+            const button = $(this);
+            const redirectId = button.data('id');
+            const currentStatus = button.data('status');
+            
+            button.prop('disabled', true).text('Processando...');
+            
+            $.post(ajaxurl, {
+                action: 'wpfl_toggle_redirect',
+                redirect_id: redirectId,
+                current_status: currentStatus,
+                nonce: '<?php echo wp_create_nonce('wpfl_toggle_redirect_nonce'); ?>'
+            }, function(response) {
+                if (response.success) {
+                    const newStatus = response.data.new_status;
+                    const newText = newStatus === 'active' ? 'Desativar' : 'Ativar';
+                    
+                    button.data('status', newStatus).text(newText);
+                    
+                    // Update status badge
+                    const statusBadge = button.closest('tr').find('span').last();
+                    if (newStatus === 'active') {
+                        statusBadge.css({
+                            'background': '#d4edda',
+                            'color': '#155724'
+                        }).text('Active');
+                    } else {
+                        statusBadge.css({
+                            'background': '#f8d7da',
+                            'color': '#721c24'
+                        }).text('Inactive');
+                    }
+                    
+                    alert(response.data.message);
+                } else {
+                    alert('Erro: ' + response.data);
+                }
+            }).fail(function() {
+                alert('Erro na comunicação com o servidor');
+            }).always(function() {
+                button.prop('disabled', false);
+            });
+        });
+        
+        // Clear all redirects
+        $('#wpfl-clear-all-redirects').click(function(e) {
+            e.preventDefault();
+            
+            if (!confirm('Tem certeza que deseja remover TODOS os redirecionamentos? Esta ação não pode ser desfeita.')) {
+                return;
+            }
+            
+            const button = $(this);
+            const originalText = button.html();
+            
+            button.prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Removendo...');
+            
+            $.post(ajaxurl, {
+                action: 'wpfl_clear_all_redirects',
+                nonce: '<?php echo wp_create_nonce('wpfl_clear_redirects_nonce'); ?>'
+            }, function(response) {
+                if (response.success) {
+                    alert(response.data.message);
+                    location.reload();
+                } else {
+                    alert('Erro: ' + response.data);
+                }
+            }).fail(function() {
+                alert('Erro na comunicação com o servidor');
+            }).always(function() {
+                button.prop('disabled', false).html(originalText);
+            });
+        });
+    });
+    </script>
+    <?php
+}
+
+// Página de diagnóstico (COMPLETA)
+function wpfl_diagnostics_page() {
+    global $wpdb;
+    
+    // Executar testes básicos
+    $tokens_table = $wpdb->prefix . 'wpfl_tokens';
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $total_tokens = $wpdb->get_var("SELECT COUNT(*) FROM $tokens_table WHERE status = 'active'");
+    $total_redirects = $wpdb->get_var("SELECT COUNT(*) FROM $redirects_table WHERE status = 'active'");
+    $redirected_links = $wpdb->get_var("SELECT COUNT(*) FROM $tokens_table WHERE is_redirected = 1 AND status = 'active'");
+    $total_redirects_count = $wpdb->get_var("SELECT SUM(redirect_count) FROM $redirects_table WHERE status = 'active'");
+    
+    if (!$total_tokens) $total_tokens = 0;
+    if (!$total_redirects) $total_redirects = 0;
+    if (!$redirected_links) $redirected_links = 0;
+    if (!$total_redirects_count) $total_redirects_count = 0;
+    
+    ?>
+    <div class="wrap wpfl-admin-wrap">
+        <h1><i class="fas fa-stethoscope"></i> Diagnóstico do Sistema</h1>
+        
+        <div class="card">
+            <h2>Status do Sistema</h2>
+            
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0;">
+                <div style="padding: 15px; background: #d4edda; border-radius: 6px; text-align: center; border: 1px solid #c3e6cb;">
+                    <h4 style="margin: 0; color: #155724;"><?php echo number_format($total_tokens); ?></h4>
+                    <p style="margin: 5px 0 0 0; color: #155724;">Links Ativos</p>
+                </div>
+                
+                <div style="padding: 15px; background: #cce5ff; border-radius: 6px; text-align: center; border: 1px solid #b3d9ff;">
+                    <h4 style="margin: 0; color: #0073aa;"><?php echo number_format($total_redirects); ?></h4>
+                    <p style="margin: 5px 0 0 0; color: #0073aa;">Redirecionamentos</p>
+                </div>
+                
+                <div style="padding: 15px; background: #fff3cd; border-radius: 6px; text-align: center; border: 1px solid #ffeaa7;">
+                    <h4 style="margin: 0; color: #856404;"><?php echo number_format($redirected_links); ?></h4>
+                    <p style="margin: 5px 0 0 0; color: #856404;">Links Redirecionados</p>
+                </div>
+                
+                <div style="padding: 15px; background: #e2e3e5; border-radius: 6px; text-align: center; border: 1px solid #d1d3d4;">
+                    <h4 style="margin: 0; color: #383d41;"><?php echo number_format($total_redirects_count); ?></h4>
+                    <p style="margin: 5px 0 0 0; color: #383d41;">Total de Acessos</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>🔗 Teste Rápido da API</h2>
+            <p>Use este botão para testar se a API está respondendo corretamente:</p>
+            <button id="test-api-btn" class="button button-primary" style="margin: 10px 0;">
+                <i class="fas fa-play"></i> Testar API
+            </button>
+            <div id="api-test-result" style="margin-top: 15px;"></div>
+        </div>
+        
+        <div class="card">
+            <h2><i class="fas fa-question-circle"></i> Testar Redirecionamento</h2>
+            
+            <form id="wpfl-test-redirect-form">
+                <div style="margin: 20px 0;">
+                    <label for="test-token"><strong>Token para Testar:</strong></label>
+                    <input type="text" id="test-token" name="test_token" placeholder="Insira um token para testar" style="width: 300px; padding: 8px; margin-left: 10px;">
+                    <button type="submit" class="button button-primary">
+                        <i class="fas fa-search"></i> Testar
+                    </button>
+                </div>
+            </form>
+            
+            <div id="test-result" style="margin-top: 20px; display: none;">
+                <h3>Resultado do Teste:</h3>
+                <div id="test-output" style="background: #f8f9fa; padding: 15px; border-radius: 6px; font-family: monospace; font-size: 12px;"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    document.getElementById('test-api-btn').addEventListener('click', async function() {
+        const button = this;
+        const resultDiv = document.getElementById('api-test-result');
+        
+        button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Testando...';
+        button.disabled = true;
+        
+        try {
+            const response = await fetch('<?php echo get_site_url(); ?>/wp-json/wpflashlinks/v1/validar-api', {
+                method: 'GET',
+                headers: {
+                    'X-API-Key': '<?php echo get_option('wpfl_api_key'); ?>'
+                }
+            });
+            
+            const data = await response.json();
+            
+            if (response.ok) {
+                resultDiv.innerHTML = `
+                    <div style="background: #d4edda; border: 1px solid #c3e6cb; padding: 15px; border-radius: 4px; color: #155724;">
+                        <h4>✅ API Funcionando!</h4>
+                        <p><strong>Site:</strong> ${data.site_name}</p>
+                        <p><strong>URL:</strong> ${data.site_url}</p>
+                        <p><strong>Versão:</strong> ${data.version || 'N/A'}</p>
+                    </div>
+                `;
+            } else {
+                throw new Error(data.message || 'Erro desconhecido');
+            }
+        } catch (error) {
+            resultDiv.innerHTML = `
+                <div style="background: #f8d7da; border: 1px solid #f5c6cb; padding: 15px; border-radius: 4px; color: #721c24;">
+                    <h4>❌ Erro na API</h4>
+                    <p>${error.message}</p>
+                </div>
+            `;
+        } finally {
+            button.innerHTML = '<i class="fas fa-play"></i> Testar API';
+            button.disabled = false;
+        }
+    });
+
+    // Test redirect
+    jQuery(document).ready(function($) {
+        $('#wpfl-test-redirect-form').submit(function(e) {
+            e.preventDefault();
+            
+            const token = $('#test-token').val().trim();
+            if (!token) {
+                alert('Por favor, insira um token para testar.');
+                return;
+            }
+            
+            $.post(ajaxurl, {
+                action: 'wpfl_test_redirect',
+                token: token,
+                nonce: '<?php echo wp_create_nonce('wpfl_test_redirect_nonce'); ?>'
+            }, function(response) {
+                $('#test-result').show();
+                $('#test-output').html(response.data.output);
+            });
+        });
+    });
+    </script>
+    <?php
+}
+
+// Página de configurações avançadas
+function wpfl_advanced_settings_page() {
+    if (isset($_POST['submit'])) {
+        update_option('wpfl_keep_data_on_uninstall', isset($_POST['keep_data']));
+        echo '<div class="notice notice-success is-dismissible"><p>Configurações salvas com sucesso!</p></div>';
+    }
+    
+    $keep_data = get_option('wpfl_keep_data_on_uninstall', false);
+    ?>
+    <div class="wrap wpfl-admin-wrap">
+        <h1>Configurações Avançadas</h1>
+        
+        <form method="post" action="">
+            <div class="card">
+                <h2>Configurações de Desinstalação</h2>
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">Manter dados na desinstalação</th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="keep_data" <?php checked($keep_data); ?>>
+                                Manter todos os tokens, redirecionamentos e configurações ao desinstalar o plugin
+                            </label>
+                            <p class="description">
+                                Se desmarcado, TODOS os dados serão removidos permanentemente na desinstalação.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+            
+            <div class="card">
+                <h2>Informações do Sistema</h2>
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">Versão do Plugin</th>
+                        <td><?php echo WPFL_VERSION; ?></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Versão do WordPress</th>
+                        <td><?php echo get_bloginfo('version'); ?></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Versão do PHP</th>
+                        <td><?php echo PHP_VERSION; ?></td>
+                    </tr>
+                    <?php
+                    global $wpdb;
+                    $tokens_table = $wpdb->prefix . 'wpfl_tokens';
+                    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+                    
+                    $total_tokens = $wpdb->get_var("SELECT COUNT(*) FROM $tokens_table");
+                    $total_redirects = $wpdb->get_var("SELECT COUNT(*) FROM $redirects_table");
+                    if (!$total_tokens) $total_tokens = 0;
+                    if (!$total_redirects) $total_redirects = 0;
+                    ?>
+                    <tr>
+                        <th scope="row">Total de Tokens</th>
+                        <td><?php echo number_format($total_tokens); ?></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Total de Redirecionamentos</th>
+                        <td><?php echo number_format($total_redirects); ?></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Status da API</th>
+                        <td><span style="color: #4CAF50; font-weight: bold;">Ativa</span></td>
+                    </tr>
+                </table>
+            </div>
+            
+            <?php submit_button('Salvar Configurações'); ?>
+        </form>
+    </div>
+    <?php
+}
+
+// ========================================
+// AJAX FUNCTIONS - SISTEMA DE REDIRECIONAMENTO COMPLETO (MANTIDO)
+// ========================================
+
+// AJAX - Exportar destinos
+function wpfl_ajax_export_destinations() {
+    if (!wp_verify_nonce($_POST['nonce'], 'wpfl_export_destinations_nonce')) {
+        wp_die('Nonce inválido');
+    }
+    
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'wpfl_tokens';
+    
+    $tokens = $wpdb->get_results("
+        SELECT token, destino, tipo, created_at 
+        FROM $table_name 
+        WHERE status = 'active' 
+        ORDER BY created_at DESC
+    ");
+    
+    $export_data = array(
+        'export_info' => array(
+            'site_name' => get_bloginfo('name'),
+            'site_url' => get_site_url(),
+            'export_date' => current_time('Y-m-d H:i:s'),
+            'total_tokens' => count($tokens),
+            'export_type' => 'destinations',
+            'version' => WPFL_VERSION
+        ),
+        'destinations' => array()
+    );
+    
+    foreach ($tokens as $token) {
+        $export_data['destinations'][] = array(
+            'token' => $token->token,
+            'destination' => $token->destino,
+            'type' => $token->tipo,
+            'created_at' => $token->created_at
+        );
+    }
+    
+    wp_send_json_success($export_data);
+}
+add_action('wp_ajax_wpfl_export_destinations', 'wpfl_ajax_export_destinations');
+
+// AJAX - Importar destinos com sistema de lotes
+function wpfl_ajax_import_destinations_batch() {
+    if (!wp_verify_nonce($_POST['nonce'], 'wpfl_import_destinations_nonce')) {
+        wp_die('Nonce inválido');
+    }
+    
+    if (!isset($_FILES['import_file'])) {
+        wp_send_json_error('Nenhum arquivo enviado');
+    }
+    
+    $file = $_FILES['import_file'];
+    $batch_size = intval($_POST['batch_size']);
+    
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        wp_send_json_error('Erro no upload do arquivo');
+    }
+    
+    $json_content = file_get_contents($file['tmp_name']);
+    $import_data = json_decode($json_content, true);
+    
+    if (!$import_data || !isset($import_data['destinations'])) {
+        wp_send_json_error('Arquivo JSON inválido ou corrompido');
+    }
+    
+    $destinations = $import_data['destinations'];
+    $total_items = count($destinations);
+    $total_batches = ceil($total_items / $batch_size);
+    
+    // Criar ID único para este lote
+    $batch_id = 'wpfl_batch_' . time() . '_' . rand(1000, 9999);
+    
+    // Salvar dados temporariamente
+    set_transient($batch_id, $destinations, 3600); // 1 hora
+    
+    wp_send_json_success(array(
+        'batch_id' => $batch_id,
+        'total_batches' => $total_batches,
+        'total_items' => $total_items,
+        'batch_size' => $batch_size
+    ));
+}
+
+add_action('wp_ajax_wpfl_import_destinations_batch', 'wpfl_ajax_import_destinations_batch');
+
+// AJAX - Processar lote individual
+function wpfl_ajax_process_batch() {
+    if (!wp_verify_nonce($_POST['nonce'], 'wpfl_process_batch_nonce')) {
+        wp_die('Nonce inválido');
+    }
+    
+    $batch_index = intval($_POST['batch_index']);
+    $batch_id = sanitize_text_field($_POST['batch_id']);
+    
+    // Recuperar dados do lote
+    $destinations = get_transient($batch_id);
+    
+    if (!$destinations) {
+        wp_send_json_error('Dados do lote não encontrados ou expirados');
+    }
+    
+    $batch_size = 100; // Valor padrão
+    if (isset($_POST['batch_size'])) {
+        $batch_size = intval($_POST['batch_size']);
+    }
+    
+    $start_index = $batch_index * $batch_size;
+    $batch_destinations = array_slice($destinations, $start_index, $batch_size);
+    
+    $processed = 0;
+    $success = 0;
+    $errors = 0;
+    
+    foreach ($batch_destinations as $destination_data) {
+        try {
+            // Gerar link local que aponta DIRETAMENTE para o destino original
+            $new_link_data = wpfl_generate_local_link_for_destination($destination_data['destination'], $destination_data['type']);
+            
+            if ($new_link_data) {
+                // Salvar mapeamento para redirecionamento futuro
+                wpfl_save_redirect_mapping(
+                    $destination_data['token'],
+                    $new_link_data['url'],
+                    'imported',
+                    $new_link_data['token']
+                );
+                
+                // Marcar token local como redirecionado
+                wpfl_mark_token_as_redirected($new_link_data['token'], $destination_data['token']);
+                
+                $success++;
+            } else {
+                $errors++;
+            }
+            $processed++;
+        } catch (Exception $e) {
+            $errors++;
+        }
+    }
+    
+    wp_send_json_success(array(
+        'processed' => $processed,
+        'success' => $success,
+        'errors' => $errors,
+        'batch_index' => $batch_index
+    ));
+}
+add_action('wp_ajax_wpfl_process_batch', 'wpfl_ajax_process_batch');
+
+// AJAX - Exportar redirecionamentos
+function wpfl_ajax_export_redirects() {
+    if (!wp_verify_nonce($_POST['nonce'], 'wpfl_export_redirects_nonce')) {
+        wp_die('Nonce inválido');
+    }
+    
+    global $wpdb;
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $redirects = $wpdb->get_results("
+        SELECT old_token, new_url, new_token 
+        FROM $redirects_table 
+        WHERE status = 'active' AND redirect_type = 'imported'
+        ORDER BY created_at DESC
+    ");
+    
+    if (empty($redirects)) {
+        wp_send_json_error('Nenhum redirecionamento disponível para exportar. Importe destinos primeiro.');
+    }
+    
+    $export_data = array(
+        'export_info' => array(
+            'site_name' => get_bloginfo('name'),
+            'site_url' => get_site_url(),
+            'export_date' => current_time('Y-m-d H:i:s'),
+            'total_redirects' => count($redirects),
+            'export_type' => 'redirects',
+            'version' => WPFL_VERSION
+        ),
+        'redirects' => array()
+    );
+    
+    foreach ($redirects as $redirect) {
+        $export_data['redirects'][] = array(
+            'old_token' => $redirect->old_token,
+            'new_url' => $redirect->new_url,
+            'new_token' => $redirect->new_token
+        );
+    }
+    
+    wp_send_json_success($export_data);
+}
+add_action('wp_ajax_wpfl_export_redirects', 'wpfl_ajax_export_redirects');
+
+// AJAX - Importar redirecionamentos para ativação
+function wpfl_ajax_import_redirects() {
+    if (!wp_verify_nonce($_POST['nonce'], 'wpfl_import_redirects_nonce')) {
+        wp_die('Nonce inválido');
+    }
+    
+    if (!isset($_FILES['redirects_file'])) {
+        wp_send_json_error('Nenhum arquivo enviado');
+    }
+    
+    $file = $_FILES['redirects_file'];
+    
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        wp_send_json_error('Erro no upload do arquivo');
+    }
+    
+    $json_content = file_get_contents($file['tmp_name']);
+    $import_data = json_decode($json_content, true);
+    
+    if (!$import_data || !isset($import_data['redirects'])) {
+        wp_send_json_error('Arquivo de redirecionamentos inválido');
+    }
+    
+    $activated = 0;
+    $errors = 0;
+    
+    foreach ($import_data['redirects'] as $redirect_data) {
+        try {
+            $result = wpfl_save_redirect_mapping(
+                $redirect_data['old_token'],
+                $redirect_data['new_url'],
+                'activated',
+                $redirect_data['new_token'] ?? ''
+            );
+            
+            if ($result) {
+                $activated++;
+            } else {
+                $errors++;
+            }
+        } catch (Exception $e) {
+            $errors++;
+        }
+    }
+    
+    wp_send_json_success(array(
+        'activated' => $activated,
+        'errors' => $errors,
+        'message' => "Redirecionamentos ativados: {$activated} sucessos, {$errors} erros."
+    ));
+}
+add_action('wp_ajax_wpfl_import_redirects', 'wpfl_ajax_import_redirects');
+
+// AJAX - Toggle redirect status
+function wpfl_ajax_toggle_redirect() {
+    if (!wp_verify_nonce($_POST['nonce'], 'wpfl_toggle_redirect_nonce')) {
+        wp_die('Nonce inválido');
+    }
+    
+    if (!current_user_can('manage_options')) {
+        wp_die('Permissão negada');
+    }
+    
+    $redirect_id = intval($_POST['redirect_id']);
+    $current_status = sanitize_text_field($_POST['current_status']);
+    $new_status = ($current_status === 'active') ? 'inactive' : 'active';
+    
+    global $wpdb;
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $result = $wpdb->update(
+        $redirects_table,
+        array('status' => $new_status),
+        array('id' => $redirect_id),
+        array('%s'),
+        array('%d')
+    );
+    
+    if ($result !== false) {
+        wp_send_json_success(array(
+            'new_status' => $new_status,
+            'message' => 'Status atualizado com sucesso!'
+        ));
+    } else {
+        wp_send_json_error('Erro ao atualizar status');
+    }
+}
+add_action('wp_ajax_wpfl_toggle_redirect', 'wpfl_ajax_toggle_redirect');
+
+// AJAX - Clear all redirects
+function wpfl_ajax_clear_all_redirects() {
+    if (!wp_verify_nonce($_POST['nonce'], 'wpfl_clear_redirects_nonce')) {
+        wp_die('Nonce inválido');
+    }
+    
+    if (!current_user_can('manage_options')) {
+        wp_die('Permissão negada');
+    }
+    
+    global $wpdb;
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    $count = $wpdb->get_var("SELECT COUNT(*) FROM $redirects_table");
+    $result = $wpdb->query("DELETE FROM $redirects_table");
+    
+    if ($result !== false) {
+        wp_send_json_success(array(
+            'message' => "Todos os {$count} redirecionamentos foram removidos!"
+        ));
+    } else {
+        wp_send_json_error('Erro ao limpar redirecionamentos');
+    }
+}
+add_action('wp_ajax_wpfl_clear_all_redirects', 'wpfl_ajax_clear_all_redirects');
+
+// AJAX - Test redirect
+function wpfl_ajax_test_redirect() {
+    if (!wp_verify_nonce($_POST['nonce'], 'wpfl_test_redirect_nonce')) {
+        wp_die('Nonce inválido');
+    }
+    
+    $token = sanitize_text_field($_POST['token']);
+    $output = array();
+    
+    $output[] = "=== TESTE DE REDIRECIONAMENTO ===";
+    $output[] = "Token testado: {$token}";
+    $output[] = "Data/Hora: " . current_time('Y-m-d H:i:s');
+    $output[] = "";
+    
+    // Verificar token local
+    $token_data = wpfl_get_token_data($token);
+    
+    if ($token_data) {
+        $output[] = "✅ TOKEN LOCAL ENCONTRADO:";
+        $output[] = "  - ID: {$token_data->id}";
+        $output[] = "  - Destino: {$token_data->destino}";
+        $output[] = "  - Tipo: {$token_data->tipo}";
+        $output[] = "  - Status: {$token_data->status}";
+        $output[] = "  - É redirecionado: " . ($token_data->is_redirected ? 'Sim' : 'Não');
+        if ($token_data->original_token) {
+            $output[] = "  - Token original: {$token_data->original_token}";
+        }
+    } else {
+        $output[] = "❌ TOKEN LOCAL NÃO ENCONTRADO";
+    }
+    
+    $output[] = "";
+    
+    // Verificar redirecionamento
+    $redirect_data = wpfl_get_redirect_mapping($token);
+    
+    if ($redirect_data) {
+        $output[] = "✅ REDIRECIONAMENTO ENCONTRADO:";
+        $output[] = "  - ID: {$redirect_data->id}";
+        $output[] = "  - Novo URL: {$redirect_data->new_url}";
+        $output[] = "  - Novo Token: {$redirect_data->new_token}";
+        $output[] = "  - Tipo: {$redirect_data->redirect_type}";
+        $output[] = "  - Status: {$redirect_data->status}";
+        $output[] = "  - Contador: {$redirect_data->redirect_count}";
+        $output[] = "  - Último acesso: " . ($redirect_data->last_redirect ?: 'Nunca');
+    } else {
+        $output[] = "❌ REDIRECIONAMENTO NÃO ENCONTRADO";
+    }
+    
+    $output[] = "";
+    $output[] = "=== RESULTADO ===";
+    
+    if ($redirect_data && $redirect_data->status === 'active') {
+        $output[] = "🔄 Este token será REDIRECIONADO para: {$redirect_data->new_url}";
+    } elseif ($token_data && $token_data->status === 'active') {
+        $output[] = "➡️ Este token será processado LOCALMENTE para: {$token_data->destino}";
+    } else {
+        $output[] = "🚫 Este token NÃO funcionará (inativo ou não encontrado)";
+    }
+    
+    wp_send_json_success(array(
+        'output' => implode("\n", $output)
+    ));
+}
+add_action('wp_ajax_wpfl_test_redirect', 'wpfl_ajax_test_redirect');
+
+// CSS padrão melhorado (versão 3.1.1)
+function wpfl_get_default_css() {
+    return '/* WP Flash Links v3.1.1 - Estilos Completos */
+.wpfl-admin-wrap { padding: 20px; }
+.card { background: #fff; padding: 20px; margin: 20px 0; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+.card h2 { margin-top: 0; border-bottom: 1px solid #ddd; padding-bottom: 10px; display: flex; align-items: center; gap: 10px; }
+.card h2 i { color: #0073aa; }
+.api-info { display: flex; flex-direction: column; gap: 15px; }
+.api-item { display: flex; flex-direction: column; gap: 8px; }
+.copy-wrapper { display: flex; align-items: center; gap: 10px; background: #f9f9f9; padding: 10px; border-radius: 6px; }
+.copy-wrapper code { flex: 1; font-family: monospace; word-break: break-all; }
+.copy-btn { background: #0073aa; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; transition: background 0.3s; }
+.copy-btn:hover { background: #005a87; }
+.input-group { display: flex; flex-direction: column; gap: 10px; margin: 20px 0; }
+.input-wrapper { display: flex; gap: 10px; flex-wrap: wrap; }
+.input-wrapper input { flex: 1; min-width: 250px; padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+.button-primary { background: #0073aa; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; transition: background 0.3s; }
+.button-primary:hover { background: #005a87; }
+.wpfl-post-card { border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin: 10px 0; }
+.large-text.code { width: 100%; font-family: monospace; }
+.description { color: #666; font-size: 13px; }
+.mt-4 { margin-top: 20px; }
+
+/* Device Options Styling */
+.wpfl-device-options { 
+    background: #f8f9fa; 
+    border: 1px solid #e9ecef; 
+    border-radius: 6px; 
+    padding: 15px; 
+    margin: 15px 0; 
+}
+.wpfl-device-options strong { 
+    color: #495057; 
+    font-size: 14px; 
+}
+.wpfl-device-options label { 
+    font-weight: normal; 
+    margin: 8px 0; 
+    padding: 5px 0; 
+    cursor: pointer; 
+    transition: background-color 0.2s; 
+    display: block;
+}
+.wpfl-device-options label:hover { 
+    background-color: rgba(0, 123, 255, 0.1); 
+    border-radius: 4px; 
+    padding-left: 8px; 
+}
+.wpfl-device-options input[type="radio"] { 
+    margin-right: 8px; 
+}
+
+/* Color Picker Styling */
+.wp-color-result { height: 32px !important; }
+.wpfl-color-picker { width: 120px !important; }
+.form-table .wpfl-color-picker { margin-right: 10px; }
+
+/* Success Notice Styling */
+.notice.notice-success { 
+    border-left-color: #4CAF50; 
+    background: #d4edda; 
+    color: #155724; 
+}
+
+/* Tab Styling Improvements */
+.wpfl-tabs-container { margin: 20px 0; }
+.wpfl-tab-header { 
+    display: flex; 
+    border-bottom: 2px solid #ddd; 
+    margin-bottom: 20px; 
+    gap: 5px; 
+    flex-wrap: wrap; 
+}
+.wpfl-tab-btn { 
+    padding: 12px 15px; 
+    border: none; 
+    background: #f0f0f0; 
+    cursor: pointer; 
+    border-radius: 5px 5px 0 0; 
+    font-size: 13px; 
+    transition: all 0.3s ease;
+}
+.wpfl-tab-btn:hover { 
+    background: #e0e0e0; 
+}
+.wpfl-tab-btn.active { 
+    background: #0073aa; 
+    color: white; 
+}
+.wpfl-tab-content { 
+    display: none; 
+}
+.wpfl-tab-content.active { 
+    display: block; 
+}
+
+/* Progress Bar Styling */
+.wpfl-progress-info { 
+    background: #f9f9f9; 
+    padding: 20px; 
+    border-radius: 8px; 
+    border: 1px solid #ddd; 
+}
+.wpfl-progress-info h3 { 
+    margin-top: 0; 
+    color: #0073aa; 
+}
+
+/* Batch Progress Styling */
+#wpfl-import-stats { 
+    font-family: monospace; 
+    font-size: 13px; 
+}
+#wpfl-import-stats p { 
+    margin: 5px 0; 
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    .wpfl-admin-wrap { padding: 10px; }
+    .input-wrapper { flex-direction: column; }
+    .input-wrapper input { width: 100%; }
+    .form-table th { width: auto; }
+    .wpfl-tab-header { flex-direction: column; }
+    .wpfl-tab-btn { border-radius: 5px; margin-bottom: 5px; }
+    .copy-wrapper { flex-direction: column; align-items: stretch; }
+    .copy-btn { margin-top: 10px; }
+}
+
+/* Link Item Styling */
+.link-item {
+    transition: all 0.3s ease;
+}
+.link-item:hover {
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    transform: translateY(-2px);
+}';
+}
+
+// JS padrão melhorado (versão 3.1.1)
+function wpfl_get_default_js() {
+    return '// WP Flash Links v3.1.1 - JavaScript
+document.addEventListener("DOMContentLoaded", function() {
+    // Setup copy buttons
+    document.addEventListener("click", function(e) {
+        if (e.target.closest(".copy-btn")) {
+            e.preventDefault();
+            const button = e.target.closest(".copy-btn");
+            let textToCopy = "";
+            
+            if (button.hasAttribute("data-copy-text")) {
+                textToCopy = button.getAttribute("data-copy-text");
+            } else if (button.closest(".copy-wrapper")) {
+                const codeElement = button.closest(".copy-wrapper").querySelector("code");
+                if (codeElement) {
+                    textToCopy = codeElement.textContent.trim();
+                }
+            }
+            
+            if (textToCopy) {
+                copyToClipboard(textToCopy, button);
+            }
+        }
+    });
+    
+    async function copyToClipboard(text, button) {
+        try {
+            if (navigator.clipboard) {
+                await navigator.clipboard.writeText(text);
+            } else {
+                const textarea = document.createElement("textarea");
+                textarea.value = text;
+                textarea.style.position = "fixed";
+                textarea.style.left = "-999999px";
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand("copy");
+                textarea.remove();
+            }
+            
+            const originalHTML = button.innerHTML;
+            button.innerHTML = "<i class=\\"fas fa-check\\"></i>";
+            button.style.background = "#28a745";
+            
+            setTimeout(() => {
+                button.innerHTML = originalHTML;
+                button.style.background = "";
+            }, 2000);
+            
+            showNotification("Copiado com sucesso!", "success");
+        } catch (err) {
+            showNotification("Erro ao copiar", "error");
+        }
+    }
+    
+   function showNotification(message, type) {
+        const notification = document.createElement("div");
+        notification.style.cssText = "position: fixed; bottom: 20px; right: 20px; padding: 15px; border-radius: 6px; z-index: 9999; transition: opacity 0.3s; box-shadow: 0 4px 15px rgba(0,0,0,0.2);";
+        notification.style.background = type === "success" ? "#4CAF50" : "#f44336";
+        notification.style.color = "white";
+        notification.textContent = message;
+        
+        document.body.appendChild(notification);
+        
+        setTimeout(() => {
+            notification.style.opacity = "0";
+            setTimeout(() => notification.remove(), 300);
+        }, 3000);
+    }
+    
+    // Initialize color pickers if available
+    if (typeof jQuery !== "undefined" && jQuery.fn.wpColorPicker) {
+        jQuery(document).ready(function($) {
+            $(".wpfl-color-picker").wpColorPicker();
+        });
+    }
+});
+
+// Generate page function for API
+async function generatePageVSL(type) {
+    const button = event.target.closest("button");
+    const originalText = button.innerHTML;
+    const input = type === "click" ? document.getElementById("pg_link_fc") : document.getElementById("pg_link_cron");
+    const link = input.value.trim();
+    
+    if (!link) {
+        alert("Por favor, insira um link válido.");
+        return;
+    }
+    
+    button.innerHTML = "<i class=\\"fas fa-spinner fa-spin\\"></i> Gerando...";
+    button.disabled = true;
+
+    try {
+        const response = await fetch(wpfl_ajax.site_url + "/wp-json/wpflashlinks/v1/gerar-link-vsl", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-API-Key": wpfl_ajax.api_key,
+                "X-WP-Nonce": wpfl_ajax.nonce
+            },
+            body: JSON.stringify({
+                link: link,
+                tipo: type
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            const resultDiv = document.getElementById("pg_result");
+            resultDiv.innerHTML = `
+                <div class="notice notice-success">
+                    <p><strong>✅ Link VSL gerado com sucesso!</strong></p>
+                    <div style="background: #f9f9f9; padding: 15px; border-radius: 6px; margin: 10px 0;">
+                        <p><strong>Tipo:</strong> ${type === "click" ? "⚡ Forçar Clique" : "⏱️ Cronômetro"}</p>
+                        <p><strong>Token:</strong> <code>${data.token}</code></p>
+                        <p><strong>Link Gerado:</strong></p>
+                        <div style="display: flex; align-items: center; gap: 10px; margin: 10px 0;">
+                            <code style="word-break: break-all; flex: 1; background: #fff; padding: 8px; border-radius: 4px;">${data.url}</code>
+                            <button class="copy-btn" data-copy-text="${data.url}">
+                                <i class="fas fa-copy"></i> Copiar
+                            </button>
+                        </div>
+                        <p><a href="${data.url}" target="_blank" style="color: #0073aa; font-weight: bold;">🔗 Visualizar Link</a></p>
+                    </div>
+                </div>
+            `;
+            input.value = "";
+        } else {
+            throw new Error(data.message || "Erro ao gerar o link.");
+        }
+    } catch (error) {
+        alert("Erro: " + error.message);
+    } finally {
+        button.innerHTML = originalText;
+        button.disabled = false;
+    }
+}';
+}
+
+// Template VSL PADRONIZADO (versão 3.1.1) - SIMPLIFICADO
+function wpfl_get_updated_template() {
+    return '<?php
+/**
+ * Template para exibição de conteúdo com parâmetro VSL
+ * Versão 3.1.1 - Template PADRONIZADO
+ * ATUALIZADO - Não será mais usado diretamente
+ */
+
+if (!defined(\'ABSPATH\')) {
+    exit;
+}
+
+// Este template agora é renderizado diretamente pela função wpfl_render_vsl_template()
+// Mantido apenas para compatibilidade
+?>';
+}
+
+// Adicionar CSS adicional no admin
+function wpfl_add_admin_styles() {
+    $screen = get_current_screen();
+    if (strpos($screen->id, 'wpfl_') !== false || strpos($screen->id, 'wp_flash_links') !== false) {
+        ?>
+        <style>
+        .wpfl-admin-wrap .notice.notice-success {
+            background: #d4edda;
+            border-left-color: #4CAF50;
+            color: #155724;
+        }
+        .wpfl-admin-wrap .notice.notice-warning {
+            background: #fff3cd;
+            border-left-color: #ffc107;
+            color: #856404;
+        }
+        .wpfl-admin-wrap .card h2 {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .wpfl-admin-wrap .card h2 i {
+            color: #0073aa;
+        }
+        .wpfl-device-options {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .wpfl-device-options strong {
+            color: #495057;
+            font-size: 14px;
+        }
+        .wpfl-device-options label {
+            font-weight: normal;
+            margin: 8px 0;
+            padding: 5px 0;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .wpfl-device-options label:hover {
+            background-color: rgba(0, 123, 255, 0.1);
+            border-radius: 4px;
+            padding-left: 8px;
+        }
+        .wp-color-result {
+            height: 32px !important;
+        }
+        .wpfl-color-picker {
+            width: 120px !important;
+        }
+        .form-table .wpfl-color-picker {
+            margin-right: 10px;
+        }
+        .link-item {
+            transition: all 0.3s ease;
+        }
+        .link-item:hover {
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            transform: translateY(-2px);
+        }
+        </style>
+        <?php
+    }
+}
+add_action('admin_head', 'wpfl_add_admin_styles');
+
+// Adicionar informações na página de plugins
+function wpfl_plugin_row_meta($links, $file) {
+    if (plugin_basename(__FILE__) === $file) {
+        $links[] = '<a href="' . admin_url('admin.php?page=wp_flash_links') . '">Configurações</a>';
+        $links[] = '<a href="' . admin_url('admin.php?page=wpfl_visual_customization') . '">Personalização</a>';
+        $links[] = '<a href="' . admin_url('admin.php?page=wpfl_redirects') . '">Redirecionamentos</a>';
+        $links[] = '<a href="' . admin_url('admin.php?page=wpfl_diagnostics') . '">Diagnóstico</a>';
+        $links[] = '<strong style="color: #4CAF50;">v3.1.1</strong>';
+    }
+    return $links;
+}
+add_filter('plugin_row_meta', 'wpfl_plugin_row_meta', 10, 2);
+
+// Hook para limpeza na desinstalação
+function wpfl_uninstall() {
+    global $wpdb;
+    
+    $keep_data = get_option('wpfl_keep_data_on_uninstall', false);
+    
+    if (!$keep_data) {
+        // Remover tabelas
+        $tokens_table = $wpdb->prefix . 'wpfl_tokens';
+        $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+        
+        $wpdb->query("DROP TABLE IF EXISTS $tokens_table");
+        $wpdb->query("DROP TABLE IF EXISTS $redirects_table");
+        
+        // Remover todas as opções do plugin
+        $options_to_delete = array(
+            'wpfl_api_key', 'wpfl_selected_posts', 'wpfl_texto_ajuda', 'wpfl_keep_data_on_uninstall',
+            'wpfl_ad_above', 'wpfl_ad_below', 'wpfl_ad_head', 'wpfl_ad_fullscreen', 'wpfl_ad_invisible',
+            'wpfl_ad_above_device', 'wpfl_ad_below_device', 'wpfl_ad_head_device', 'wpfl_ad_fullscreen_device', 'wpfl_ad_invisible_device',
+            'wpfl_click_text', 'wpfl_click_auto_time', 'wpfl_timer_text', 'wpfl_timer_time', 'wpfl_button_text',
+            'wpfl_click_bg_color', 'wpfl_click_border_color', 'wpfl_click_text_color', 'wpfl_click_border_width', 'wpfl_click_device',
+            'wpfl_timer_bg_color', 'wpfl_timer_border_color', 'wpfl_timer_text_color', 'wpfl_timer_border_width', 'wpfl_timer_device',
+            'wpfl_button_bg_color', 'wpfl_button_border_color', 'wpfl_button_text_color', 'wpfl_button_border_width', 'wpfl_button_device',
+            'wpfl_last_generated_link', 'wpfl_version'
+        );
+        
+        foreach ($options_to_delete as $option) {
+            delete_option($option);
+        }
+    }
+}
+register_uninstall_hook(__FILE__, 'wpfl_uninstall');
+
+// Função de migração para v3.1.1
+function wpfl_migrate_to_v311() {
+    $current_version = get_option('wpfl_version', '0');
+    
+    if (version_compare($current_version, '3.1.1', '<')) {
+        global $wpdb;
+        $tokens_table = $wpdb->prefix . 'wpfl_tokens';
+        $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+        
+        // Verificar se as tabelas existem
+        if ($wpdb->get_var("SHOW TABLES LIKE '$tokens_table'") != $tokens_table) {
+            wpfl_activate(); // Criar tabelas se não existirem
+        }
+        
+        // Adicionar novas colunas se não existirem
+        $columns = $wpdb->get_results("SHOW COLUMNS FROM $tokens_table");
+        $has_is_redirected = false;
+        $has_original_token = false;
+        $has_slug = false;
+        
+        foreach ($columns as $column) {
+            if ($column->Field === 'is_redirected') {
+                $has_is_redirected = true;
+            }
+            if ($column->Field === 'original_token') {
+                $has_original_token = true;
+            }
+            if ($column->Field === 'slug') {
+                $has_slug = true;
+            }
+        }
+        
+        if (!$has_is_redirected) {
+            $wpdb->query("ALTER TABLE $tokens_table ADD COLUMN is_redirected tinyint(1) DEFAULT 0");
+        }
+        
+        if (!$has_original_token) {
+            $wpdb->query("ALTER TABLE $tokens_table ADD COLUMN original_token varchar(20) DEFAULT NULL");
+        }
+        
+        if (!$has_slug) {
+            $wpdb->query("ALTER TABLE $tokens_table ADD COLUMN slug varchar(128) DEFAULT NULL");
+            $wpdb->query("ALTER TABLE $tokens_table ADD KEY slug_idx (slug)");
+        }
+        
+        // Verificar colunas da tabela de redirecionamentos
+        $redirect_columns = $wpdb->get_results("SHOW COLUMNS FROM $redirects_table");
+        $has_new_token = false;
+        $has_redirect_count = false;
+        $has_last_redirect = false;
+        
+        foreach ($redirect_columns as $column) {
+            if ($column->Field === 'new_token') {
+                $has_new_token = true;
+            }
+            if ($column->Field === 'redirect_count') {
+                $has_redirect_count = true;
+            }
+            if ($column->Field === 'last_redirect') {
+                $has_last_redirect = true;
+            }
+        }
+        
+        if (!$has_new_token) {
+            $wpdb->query("ALTER TABLE $redirects_table ADD COLUMN new_token varchar(20) DEFAULT NULL");
+        }
+        
+        if (!$has_redirect_count) {
+            $wpdb->query("ALTER TABLE $redirects_table ADD COLUMN redirect_count int DEFAULT 0");
+        }
+        
+        if (!$has_last_redirect) {
+            $wpdb->query("ALTER TABLE $redirects_table ADD COLUMN last_redirect timestamp NULL DEFAULT NULL");
+        }
+        
+        // Atualizar template
+        $template_file = WPFL_PLUGIN_DIR . 'templates/vsl-template.php';
+        if (file_exists($template_file)) {
+            file_put_contents($template_file, wpfl_get_updated_template());
+        }
+        
+        // Definir configurações padrão
+        wpfl_set_default_options();
+        
+        // Flush rewrite rules para aplicar as novas regras
+        wpfl_add_rewrite_rules();
+        flush_rewrite_rules();
+        
+        // Atualizar versão
+        update_option('wpfl_version', '3.1.1');
+    }
+}
+add_action('admin_init', 'wpfl_migrate_to_v311');
+
+// Limpar todos os eventos agendados na desativação
+function wpfl_clear_scheduled_events() {
+    wp_clear_scheduled_hook('wpfl_cleanup_deleted_tokens');
+}
+register_deactivation_hook(__FILE__, 'wpfl_clear_scheduled_events');
+
+// Adicionar informações de sistema no footer do admin
+function wpfl_admin_footer_info() {
+    $screen = get_current_screen();
+    if (strpos($screen->id, 'wpfl_') !== false || strpos($screen->id, 'wp_flash_links') !== false) {
+        global $wpdb;
+        $tokens_count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}wpfl_tokens WHERE status = 'active'");
+        $redirects_count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}wpfl_redirects WHERE status = 'active'");
+        
+        echo '<div style="margin-top: 30px; padding: 10px; background: #f9f9f9; border-radius: 4px; font-size: 11px; color: #666;">';
+        echo '<strong>WP Flash Links v' . WPFL_VERSION . '</strong> | ';
+        echo 'Links Ativos: ' . number_format($tokens_count) . ' | ';
+        echo 'Redirecionamentos: ' . number_format($redirects_count) . ' | ';
+        echo 'Memória: ' . size_format(memory_get_usage()) . ' | ';
+        echo 'Endpoint: <code>/gerar-link-vsl</code> ';
+        echo '</div>';
+    }
+}
+add_action('admin_footer', 'wpfl_admin_footer_info');
+
+// Adicionar meta box de informações no dashboard
+function wpfl_dashboard_widget() {
+    wp_add_dashboard_widget(
+        'wpfl_dashboard_widget',
+        'WP Flash Links - Status',
+        'wpfl_dashboard_widget_content'
+    );
+}
+
+function wpfl_dashboard_widget_content() {
+    global $wpdb;
+    $tokens_count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}wpfl_tokens WHERE status = 'active'");
+    ?>
+    <div style="display: flex; align-items: center; gap: 15px;">
+        <div style="background: #4CAF50; color: white; padding: 15px; border-radius: 8px; text-align: center; min-width: 80px;">
+            <h3 style="margin: 0; font-size: 24px;"><?php echo number_format($tokens_count); ?></h3>
+            <p style="margin: 5px 0 0 0; font-size: 12px;">Links Ativos</p>
+        </div>
+        <div>
+            <h4 style="margin: 0 0 5px 0;">API Funcionando</h4>
+            <p style="margin: 0; font-size: 13px; color: #666;">
+                Endpoint: <code>/gerar-link-vsl</code><br>
+                Versão: <?php echo WPFL_VERSION; ?>
+            </p>
+            <p style="margin: 10px 0 0 0;">
+                <a href="<?php echo admin_url('admin.php?page=wp_flash_links'); ?>" class="button button-primary button-small">Gerenciar</a>
+                <a href="<?php echo admin_url('admin.php?page=wpfl_diagnostics'); ?>" class="button button-secondary button-small">Diagnóstico</a>
+            </p>
+        </div>
+    </div>
+    <?php
+}
+add_action('wp_dashboard_setup', 'wpfl_dashboard_widget');
+
+// Log de atividade da API (opcional)
+function wpfl_log_api_activity($endpoint, $success = true, $details = '') {
+    if (defined('WP_DEBUG_LOG') && WP_DEBUG_LOG) {
+        $log_message = sprintf(
+            '[WP Flash Links] API %s - Endpoint: %s - Success: %s - Details: %s - Time: %s',
+            $success ? 'SUCCESS' : 'ERROR',
+            $endpoint,
+            $success ? 'YES' : 'NO',
+            $details,
+            current_time('Y-m-d H:i:s')
+        );
+        error_log($log_message);
+    }
+}
+
+// Adicionar log na função principal de geração
+add_action('rest_api_init', function() {
+    add_filter('rest_pre_dispatch', function($result, $server, $request) {
+        if (strpos($request->get_route(), '/wpflashlinks/v1/') === 0) {
+            wpfl_log_api_activity(
+                $request->get_route(),
+                true,
+                'Request received: ' . $request->get_method()
+            );
+        }
+        return $result;
+    }, 10, 3);
+});
+
+// Função para verificar e corrigir permissões de API
+function wpfl_check_api_permissions() {
+    // Verificar se as rotas estão registradas corretamente
+    $routes = rest_get_server()->get_routes();
+    $has_gerar_link_vsl = isset($routes['/wpflashlinks/v1/gerar-link-vsl']);
+    $has_validar_api = isset($routes['/wpflashlinks/v1/validar-api']);
+    
+    if (!$has_gerar_link_vsl || !$has_validar_api) {
+        // Forçar re-registro das rotas
+        wpfl_register_rest_routes();
+        
+        // Limpar cache de permalinks
+        flush_rewrite_rules();
+    }
+}
+add_action('init', 'wpfl_check_api_permissions', 20);
+
+// Debug endpoint (apenas para desenvolvimento)
+function wpfl_debug_endpoint() {
+    if (defined('WP_DEBUG') && WP_DEBUG && current_user_can('manage_options')) {
+        register_rest_route('wpflashlinks/v1', '/debug', array(
+            'methods' => 'GET',
+            'callback' => function() {
+                return array(
+                    'version' => WPFL_VERSION,
+                    'api_key_exists' => !empty(get_option('wpfl_api_key')),
+                    'tables_exist' => array(
+                        'tokens' => $GLOBALS['wpdb']->get_var("SHOW TABLES LIKE '{$GLOBALS['wpdb']->prefix}wpfl_tokens'") !== null,
+                        'redirects' => $GLOBALS['wpdb']->get_var("SHOW TABLES LIKE '{$GLOBALS['wpdb']->prefix}wpfl_redirects'") !== null
+                    ),
+                    'endpoints' => array(
+                        'validar-api' => '/wp-json/wpflashlinks/v1/validar-api',
+                        'gerar-link-vsl' => '/wp-json/wpflashlinks/v1/gerar-link-vsl',
+                        'gerar-link' => '/wp-json/wpflashlinks/v1/gerar-link',
+                        'status' => '/wp-json/wpflashlinks/v1/status'
+                    ),
+                    'timestamp' => current_time('Y-m-d H:i:s')
+                );
+            },
+            'permission_callback' => '__return_true'
+        ));
+    }
+}
+add_action('rest_api_init', 'wpfl_debug_endpoint');
+
+// Remover formatação automática do WordPress para os shortcodes
+remove_filter('the_content', 'wpautop');
+add_filter('the_content', function($content) {
+    if (has_shortcode($content, 'pg_ad_above') || 
+        has_shortcode($content, 'pg_ad_below') || 
+        has_shortcode($content, 'pg_ad_head') ||
+        has_shortcode($content, 'pg_ad_fullscreen') ||
+        has_shortcode($content, 'pg_ad_invisible') ||
+        has_shortcode($content, 'texto_ajuda')) {
+        return $content;
+    }
+    return wpautop($content);
+});
+
+// Função de inicialização final
+function wpfl_final_init() {
+    // Garantir que todas as configurações estão definidas
+    wpfl_set_default_options();
+    
+    // Verificar integridade dos arquivos essenciais
+    wpfl_create_assets_directories();
+    
+    // Migrar para versão 3.1.1 se necessário
+    wpfl_migrate_to_v311();
+    
+    // Verificar permissões da API
+    wpfl_check_api_permissions();
+}
+add_action('init', 'wpfl_final_init');
+
+// Função final de verificação
+function wpfl_final_check() {
+    // Verificar se tudo está funcionando
+    $api_key = get_option('wpfl_api_key');
+    $tables_exist = $GLOBALS['wpdb']->get_var("SHOW TABLES LIKE '{$GLOBALS['wpdb']->prefix}wpfl_tokens'") !== null;
+    
+    if (empty($api_key) || !$tables_exist) {
+        // Silencioso - sem notices automáticas
+        return false;
+    }
+    
+    return true;
+}
+add_action('admin_init', 'wpfl_final_check');
+
+// Adicionar notice de boas-vindas após ativação
+function wpfl_activation_notice() {
+    if (get_transient('wpfl_activation_notice')) {
+        ?>
+        <div class="notice notice-success is-dismissible">
+            <p><strong>🎉 WP Flash Links v3.1.1 ativado com sucesso!</strong></p>
+            <p>
+                ✅ API configurada e funcionando<br>
+                ✅ Sistema de redirecionamento completo<br>
+                ✅ Templates atualizados<br>
+                ✅ Banco de dados otimizado<br>
+                ✅ <strong style="color: #4CAF50;">PROBLEMA DO TÍTULO CORRIGIDO!</strong>
+            </p>
+            <p>
+                <a href="<?php echo admin_url('admin.php?page=wp_flash_links'); ?>" class="button button-primary">Começar Agora</a>
+                <a href="<?php echo admin_url('admin.php?page=wpfl_diagnostics'); ?>" class="button button-secondary">Testar Sistema</a>
+            </p>
+        </div>
+        <?php
+        delete_transient('wpfl_activation_notice');
+    }
+}
+add_action('admin_notices', 'wpfl_activation_notice');
+
+// Definir transient na ativação
+function wpfl_set_activation_notice() {
+    set_transient('wpfl_activation_notice', true, 60);
+}
+register_activation_hook(__FILE__, 'wpfl_set_activation_notice');
+
+// Função para verificar compatibilidade do sistema
+function wpfl_system_compatibility_check() {
+    $issues = array();
+    
+    // Verificar versão do PHP
+    if (version_compare(PHP_VERSION, '7.4', '<')) {
+        $issues[] = 'PHP 7.4+ requerido. Versão atual: ' . PHP_VERSION;
+    }
+    
+    // Verificar versão do WordPress
+    if (version_compare(get_bloginfo('version'), '5.0', '<')) {
+        $issues[] = 'WordPress 5.0+ requerido. Versão atual: ' . get_bloginfo('version');
+    }
+    
+    // Verificar se cURL está disponível
+    if (!function_exists('curl_init')) {
+        $issues[] = 'Extensão cURL do PHP não está disponível';
+    }
+    
+    // Verificar permissões de escrita
+    if (!is_writable(WPFL_PLUGIN_DIR)) {
+        $issues[] = 'Diretório do plugin não tem permissão de escrita';
+    }
+    
+    return $issues;
+}
+
+// Exibir avisos de compatibilidade se necessário
+function wpfl_compatibility_notices() {
+    $issues = wpfl_system_compatibility_check();
+    
+    if (!empty($issues)) {
+        ?>
+        <div class="notice notice-warning">
+            <p><strong>WP Flash Links - Avisos de Compatibilidade:</strong></p>
+            <ul>
+                <?php foreach ($issues as $issue): ?>
+                    <li><?php echo esc_html($issue); ?></li>
+                <?php endforeach; ?>
+            </ul>
+        </div>
+        <?php
+    }
+}
+add_action('admin_notices', 'wpfl_compatibility_notices');
+
+// Hook final de verificação de integridade
+function wpfl_integrity_check() {
+    // Verificar se as funções principais existem
+    $required_functions = array(
+        'wpfl_gerar_link_vsl',
+        'wpfl_process_vsl_request',
+        'wpfl_get_token_data',
+        'wpfl_get_redirect_mapping'
+    );
+    
+    foreach ($required_functions as $function) {
+        if (!function_exists($function)) {
+            error_log("WP Flash Links: Função crítica ausente: $function");
+        }
+    }
+    
+    // Verificar se as tabelas existem
+    global $wpdb;
+    $tokens_table = $wpdb->prefix . 'wpfl_tokens';
+    $redirects_table = $wpdb->prefix . 'wpfl_redirects';
+    
+    if ($wpdb->get_var("SHOW TABLES LIKE '$tokens_table'") != $tokens_table) {
+        error_log("WP Flash Links: Tabela de tokens não encontrada");
+    }
+    
+    if ($wpdb->get_var("SHOW TABLES LIKE '$redirects_table'") != $redirects_table) {
+        error_log("WP Flash Links: Tabela de redirecionamentos não encontrada");
+    }
+}
+add_action('wp_loaded', 'wpfl_integrity_check');
+
+// Função para flush automático das rewrite rules quando necessário
+function wpfl_maybe_flush_rewrite_rules() {
+    $rules_version = get_option('wpfl_rewrite_rules_version', '0');
+    
+    if (version_compare($rules_version, WPFL_VERSION, '<')) {
+        flush_rewrite_rules();
+        update_option('wpfl_rewrite_rules_version', WPFL_VERSION);
+    }
+}
+add_action('init', 'wpfl_maybe_flush_rewrite_rules', 999);
+
+// Adicionar informação sobre correção no footer
+function wpfl_footer_correction_info() {
+    $screen = get_current_screen();
+    if (strpos($screen->id, 'wpfl_') !== false || strpos($screen->id, 'wp_flash_links') !== false) {
+        echo '<div style="margin-top: 20px; padding: 15px; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 4px; color: #155724;">';
+        echo '<strong>✅ CORREÇÃO APLICADA:</strong> O problema de título "página não encontrada" foi resolvido! ';
+        echo 'Todas as URLs antigas e novas agora funcionam corretamente.';
+        echo '</div>';
+    }
+}
+add_action('admin_footer', 'wpfl_footer_correction_info');
+
+// IMPORTANTE: Garantir que as rewrite rules sejam aplicadas na ativação
+function wpfl_ensure_rewrite_rules() {
+    // Adicionar as regras
+    wpfl_add_rewrite_rules();
+    
+    // Flush as regras para aplicar
+    flush_rewrite_rules();
+    
+    // Marcar que as regras foram aplicadas
+    update_option('wpfl_rewrite_rules_flushed', time());
+}
+
+// Função para evitar conflitos com posts/páginas existentes
+function wpfl_check_existing_content($slug) {
+    global $wpdb;
+    
+    // Verificar se existe post/página com este slug
+    $existing = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->posts} 
+             WHERE post_name = %s 
+             AND post_status IN ('publish', 'private') 
+             AND post_type IN ('post', 'page')",
+            $slug
+        )
+    );
+    
+    return $existing > 0;
+}
+
+// Hook para flush automático quando necessário
+add_action('init', function() {
+    $version_checked = get_option('wpfl_rewrite_fixed', '0');
+    if ($version_checked !== WPFL_VERSION) {
+        flush_rewrite_rules();
+        update_option('wpfl_rewrite_fixed', WPFL_VERSION);
+    }
+}, 999);
+
+// Hook para garantir que as regras sejam aplicadas
+add_action('init', function() {
+    $last_flush = get_option('wpfl_rewrite_rules_flushed', 0);
+    $plugin_activation = get_option('wpfl_version', '0');
+    
+    // Se o plugin foi atualizado ou nunca fez flush, fazer agora
+    if ($last_flush < strtotime('-1 hour') || version_compare($plugin_activation, '3.1.1', '>=')) {
+        wpfl_ensure_rewrite_rules();
+    }
+}, 1000);
+?>
